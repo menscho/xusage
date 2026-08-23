@@ -1,0 +1,13 @@
+# Built binaries (root binary plus any go build -o artifacts)
+*.exe
+*.exe~
+
+# Stray tray log from earlier builds
+xusage-tray.log
+
+# Local scratch space: perf corpora, throwaway harnesses, upstream source dumps
+.tmp/
+
+# Profiling and coverage output
+*.prof
+*.out
