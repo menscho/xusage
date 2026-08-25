@@ -14,7 +14,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -261,10 +263,78 @@ func epochMillis(s string) (int64, bool) {
 	return v * 1000, true // seconds
 }
 
+// jsonxDiscoveryCacheTTL bounds how long a cached discovery survives without a
+// full re-walk. The root-mtime fingerprint is the cheap staleness sentinel;
+// this backstop bounds the worst case (a nested addition whose ancestor mtime
+// happens to match) and stops an atrophied entry from living forever. Tuned
+// well above the 2s poll interval so steady-state polls never re-walk.
+const jsonxDiscoveryCacheTTL = 30 * time.Second
+
+// jsonxDiscoveryKey identifies one cached CollectFiles result. A struct key
+// avoids the per-call string-concat allocation that a "roots\x00exts" key
+// would otherwise require on every poll, and cannot collide the way a joined
+// string could (("a","bc") vs ("ab","c")).
+type jsonxDiscoveryKey struct {
+	roots string
+	exts  string
+}
+
+// jsonxDiscoveryEntry is one cached CollectFiles result plus the mtime
+// fingerprint of its roots (the cheap staleness sentinel) and the store time
+// (the TTL backstop). The files slice is cap-pinned so a caller that appends
+// to it cannot scribble on the cache's backing array.
+type jsonxDiscoveryEntry struct {
+	files  []string
+	fp     string
+	stored time.Time
+}
+
+var (
+	jsonxDiscoveryMu    sync.Mutex
+	jsonxDiscoveryCache = map[jsonxDiscoveryKey]jsonxDiscoveryEntry{}
+)
+
+// discoveryFP builds a cheap staleness fingerprint for roots: one segment per
+// root holding its mtime (absent roots contribute ""). Two snapshots with the
+// same fingerprint have identical per-root mtimes, so the walked tree is
+// unchanged. NUL separators can't appear in paths, keeping segments unambiguous.
+func discoveryFP(roots []string) string {
+	var b strings.Builder
+	for i, r := range roots {
+		if i > 0 {
+			b.WriteByte(0)
+		}
+		if fi, err := os.Stat(r); err == nil {
+			b.WriteString(strconv.FormatInt(fi.ModTime().UnixMicro(), 10))
+		}
+	}
+	return b.String()
+}
+
 // CollectFiles walks each root recursively gathering files whose lowercase
 // extension is in exts (with dot), optionally filtered by name. Missing roots
 // are silently skipped — absence of data is normal. Results are sorted.
+//
+// The filter==nil path is memoized per (roots, exts): a poll whose per-root
+// mtimes are unchanged since the last walk returns the cached list instead of
+// re-reading the tree, so the 2s discovery tick costs only os.Stat calls in
+// steady state. When filter is non-nil the call is not cached, since the
+// filter func can't be part of the key. The TTL eventually forces a re-walk
+// to bound staleness for nested additions.
 func CollectFiles(roots []string, exts []string, filter func(name string) bool) []string {
+	// key and fp are computed once per call and reused for both the cache
+	// lookup and the store, so a poll pays a single concat + a single set of
+	// os.Stat calls regardless of hit/miss. The struct key also cannot collide
+	// the way a joined string could (("a","bc") vs ("ab","c")).
+	var key jsonxDiscoveryKey
+	var fp string
+	if filter == nil {
+		key = jsonxDiscoveryKey{roots: strings.Join(roots, "\x00"), exts: strings.Join(exts, "\x00")}
+		fp = discoveryFP(roots)
+		if files, ok := jsonxCollectCached(key, fp); ok {
+			return files
+		}
+	}
 	want := map[string]bool{}
 	for _, e := range exts {
 		want[strings.ToLower(e)] = true
@@ -306,7 +376,27 @@ func CollectFiles(roots []string, exts []string, filter func(name string) bool) 
 		}
 	}
 	sortStrings(out)
+	if filter == nil {
+		out = out[:len(out):len(out)] // pin cap: append-safe cache line
+		jsonxDiscoveryMu.Lock()
+		jsonxDiscoveryCache[key] = jsonxDiscoveryEntry{files: out, fp: fp, stored: time.Now()}
+		jsonxDiscoveryMu.Unlock()
+	}
 	return out
+}
+
+// jsonxCollectCached returns the memoized result for key when the per-root
+// mtime fingerprint is unchanged within the TTL. The boolean is false on a miss
+// (stale mtime, expired TTL, or absent entry), in which case the caller
+// performs the real walk and stores via CollectFiles.
+func jsonxCollectCached(key jsonxDiscoveryKey, fp string) ([]string, bool) {
+	jsonxDiscoveryMu.Lock()
+	e, ok := jsonxDiscoveryCache[key]
+	jsonxDiscoveryMu.Unlock()
+	if !ok || time.Since(e.stored) >= jsonxDiscoveryCacheTTL || e.fp != fp {
+		return nil, false
+	}
+	return e.files, true
 }
 
 // ExistingDirs filters candidates to existing directories, de-duplicated.

@@ -72,8 +72,8 @@ func TestBlocksSingleBlock(t *testing.T) {
 	if len(b.Models) != 1 || b.Models[0] != "claude-sonnet-4-20250514" {
 		t.Errorf("models = %v", b.Models)
 	}
-	if len(b.Entries) != 3 {
-		t.Errorf("entries = %d, want 3", len(b.Entries))
+	if b.Messages != 3 {
+		t.Errorf("entries (via messages) = %d, want 3", b.Messages)
 	}
 }
 
@@ -138,8 +138,8 @@ func TestBlocksBoundaryExactlyFiveHoursStays(t *testing.T) {
 	if len(blocks) != 1 {
 		t.Fatalf("got %d blocks, want 1 (boundary is inclusive)", len(blocks))
 	}
-	if len(blocks[0].Entries) != 2 {
-		t.Errorf("entries = %d, want 2", len(blocks[0].Entries))
+	if blocks[0].Messages != 2 {
+		t.Errorf("entries (via messages) = %d, want 2", blocks[0].Messages)
 	}
 }
 
@@ -190,18 +190,18 @@ func TestBlocksGapInsertion(t *testing.T) {
 	if gap.ActualEndTime != nil || gap.IsActive {
 		t.Errorf("gap must be inactive with no actual end")
 	}
-	if gap.TotalTokens != 0 || len(gap.Entries) != 0 || gap.Cost != 0 {
-		t.Errorf("gap must stay empty, got tokens=%d cost=%v", gap.TotalTokens, gap.Cost)
+	if gap.TotalTokens != 0 || gap.Messages != 0 || gap.Cost != 0 {
+		t.Errorf("gap must stay empty, got tokens=%d messages=%d cost=%v", gap.TotalTokens, gap.Messages, gap.Cost)
 	}
 	if want := at(16, 0); !blocks[2].StartTime.Equal(want) {
 		t.Errorf("post-gap block start = %v, want %v", blocks[2].StartTime, want)
 	}
 	// Entries must stay with their own blocks (no slice aliasing).
-	if len(blocks[0].Entries) != 2 {
-		t.Errorf("first block entries = %d, want 2 (aliasing bug)", len(blocks[0].Entries))
+	if blocks[0].Messages != 2 {
+		t.Errorf("first block entries (via messages) = %d, want 2 (aliasing bug)", blocks[0].Messages)
 	}
-	if len(blocks[2].Entries) != 1 {
-		t.Errorf("last block entries = %d, want 1", len(blocks[2].Entries))
+	if blocks[2].Messages != 1 {
+		t.Errorf("last block entries (via messages) = %d, want 1", blocks[2].Messages)
 	}
 	if blocks[0].InputTokens != 200 {
 		t.Errorf("first block input = %d, want 200 (clobbered by aliasing?)", blocks[0].InputTokens)
@@ -383,7 +383,7 @@ func TestBlocksHonorsOptsSessionAndTZFilters(t *testing.T) {
 	snap := mkSnapshot(e1, e2)
 
 	blocks := snap.Blocks(&Opts{Session: "s2"}, DefaultBlockHours, farFuture)
-	if len(blocks) != 1 || len(blocks[0].Entries) != 1 || blocks[0].InputTokens != 100 {
+	if len(blocks) != 1 || blocks[0].Messages != 1 || blocks[0].InputTokens != 100 {
 		t.Fatalf("session filter: want 1 block holding only s2, got %+v", blocks)
 	}
 

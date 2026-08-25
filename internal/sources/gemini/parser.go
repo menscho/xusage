@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"xusage/internal/model"
+	"xusage/internal/sources/adapter"
 	"xusage/internal/sources/jsonx"
 )
 
@@ -56,10 +57,15 @@ func parseFile(path string) []model.Entry {
 	return p.entries
 }
 
+// recordKeys are the object fields this adapter consumes; an object carrying
+// any of them is a usage record. Hoisted to package scope so the per-line scan
+// does not allocate a fresh slice each call.
+var recordKeys = []string{"tokens", "stats", "result", "messages"}
+
 // looksLikeRecord reports whether an object carries any field this adapter
-// consumes (tokens/stats/result/messages), keeping unrelated JSON files out.
+// consumes, keeping unrelated JSON files out.
 func looksLikeRecord(m map[string]any) bool {
-	for _, key := range []string{"tokens", "stats", "result", "messages"} {
+	for _, key := range recordKeys {
 		if _, ok := m[key]; ok {
 			return true
 		}
@@ -282,10 +288,11 @@ func buildEntry(ev geminiEvent, ms int64, sessionID string) (model.Entry, bool) 
 	input, cacheRead := ev.norm(t)
 	input += t.tool // tool-call tokens are billable input (upstream build_event)
 
+	m := adapter.Intern(modelName)
 	e := model.Entry{
 		Timestamp:       timeFromMillis(ms),
-		RawModel:        modelName,
-		Model:           modelName,
+		RawModel:        m,
+		Model:           m,
 		SessionID:       sessionID,
 		InputTokens:     input,
 		CacheReadTokens: cacheRead,

@@ -9,7 +9,6 @@ package engine
 
 import (
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -29,9 +28,13 @@ type ProviderStatus struct {
 }
 
 // fileCache is the parsed state of one data file: the stat fingerprint the
-// entries were produced from plus the entries themselves (already priced,
-// pre-dedup). Snapshots own their caches; they are never mutated after
-// construction.
+// entries were produced from plus the entries themselves (already priced and
+// per-file deduped). Deduping at parse time is a confluent fold — canonical
+// selection uses a total order (prefer) and sidechain supersession is
+// order-independent, so folding within each file then across files equals
+// folding the whole set at once: dedupe(A∪B) ≡ dedupe(dedupe(A)∪dedupe(B)).
+// This shrinks the cache and the later global pass without changing results.
+// Snapshots own their caches; they are never mutated after construction.
 type fileCache struct {
 	path    string
 	modTime time.Time
@@ -54,6 +57,45 @@ var (
 	current       atomic.Pointer[Snapshot]
 	emptySnapshot = &Snapshot{BuiltAt: time.Unix(0, 0).UTC()}
 )
+
+// loadJobSlicePool reuses the scratch []loadJob backing arrays that loadAll
+// builds every poll: the discovery list and the pending-parse list. Both are
+// discarded once the snapshot is assembled, but at the steady-state cadence
+// they are rebuilt every poll; pooling their backing arrays avoids re-growth
+// after the first pass (capacity is retained across refreshes, only length is
+// reset on release). The slices are always released via defer, so an early
+// idle short-circuit return cannot leak them.
+var loadJobSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]loadJob, 0, 128)
+		return &s
+	},
+}
+
+func getLoadJobSlice() *[]loadJob { return loadJobSlicePool.Get().(*[]loadJob) }
+
+func putLoadJobSlice(s *[]loadJob) {
+	*s = (*s)[:0]
+	loadJobSlicePool.Put(s)
+}
+
+// statusPool reuses the per-source status map that loadAll fills every poll.
+// Released via defer, so the idle short-circuit puts it back instead of
+// allocating a fresh map — after warmup, an idle poll makes no map allocation.
+var statusPool = sync.Pool{
+	New: func() any {
+		return make(map[string]*ProviderStatus)
+	},
+}
+
+func getStatusMap() map[string]*ProviderStatus { return statusPool.Get().(map[string]*ProviderStatus) }
+
+func putStatusMap(m map[string]*ProviderStatus) {
+	for k := range m {
+		delete(m, k)
+	}
+	statusPool.Put(m)
+}
 
 // parseCalls counts files actually handed to a parser since process start.
 // It lets tests assert that an incremental refresh only reparses files whose
@@ -184,8 +226,19 @@ type loadJob struct {
 // from prev, parses the rest in parallel, dedupes, and assembles the snapshot.
 // Costs are resolved per file at parse time, so reused files pay nothing.
 func loadAll(prev *Snapshot) *Snapshot {
-	var jobs []loadJob
-	status := map[string]*ProviderStatus{}
+	// jobs and pending are pure scratch: discarded once the snapshot is built.
+	// Pool their backing arrays so a steady-state poll reuses capacity instead
+	// of re-growing from nil every tick. defer releases them even on the
+	// idle short-circuit return below.
+	jobs := getLoadJobSlice()
+	defer putLoadJobSlice(jobs)
+	pending := getLoadJobSlice()
+	defer putLoadJobSlice(pending)
+
+	// Pooled (not freshly allocated) so the idle short-circuit below returns
+	// it via defer without a file-count-sized map allocation on an idle poll.
+	status := getStatusMap()
+	defer putStatusMap(status)
 
 	for _, src := range sources.All() {
 		st := &ProviderStatus{Name: src.Name}
@@ -201,7 +254,7 @@ func loadAll(prev *Snapshot) *Snapshot {
 			if statErr != nil {
 				continue // vanished mid-scan; picked up on the next refresh
 			}
-			jobs = append(jobs, loadJob{
+			*jobs = append(*jobs, loadJob{
 				source:  src.Name,
 				path:    p,
 				modTime: fi.ModTime(),
@@ -210,24 +263,38 @@ func loadAll(prev *Snapshot) *Snapshot {
 		}
 	}
 
-	prevByPath := make(map[string]fileCache, len(jobs))
+	// Idle short-circuit: nothing added, removed, or changed. Every discovered
+	// file matches a prev cache (same path, size, and mtime) and the set is the
+	// same size (no deletions), so rebuilding would yield a snapshot identical
+	// to prev. Return prev verbatim — the frozen-snapshot contract still holds
+	// (prev is already immutable), and we skip the flatten/dedupe/sort/intern
+	// pass plus its allocations. This is the difference between an idle poll
+	// that touches only the per-file stat cache and one that rebuilds the
+	// whole snapshot. Checked here — before allocating the prevByPath map and
+	// caches slice below — so an idle poll makes no file-count-sized
+	// allocation. Idleness is detected by an allocation-free binary search over
+	// the already-sorted prev.files (see jobsMatchPrev).
+	if prev != nil && len(*jobs) == len(prev.files) && jobsMatchPrev(*jobs, prev.files) {
+		return prev
+	}
+
+	prevByPath := make(map[string]fileCache, len(*jobs))
 	if prev != nil {
 		for _, f := range prev.files {
 			prevByPath[f.path] = f
 		}
 	}
 
-	caches := make([]fileCache, 0, len(jobs))
-	var pending []loadJob
-	for _, j := range jobs {
+	caches := make([]fileCache, 0, len(*jobs))
+	for _, j := range *jobs {
 		if f, ok := prevByPath[j.path]; ok && f.size == j.size && f.modTime.Equal(j.modTime) {
 			caches = append(caches, f)
 			continue
 		}
-		pending = append(pending, j)
+		*pending = append(*pending, j)
 	}
 
-	parsePending(pending, &caches)
+	parsePending(*pending, &caches)
 	sort.Slice(caches, func(i, j int) bool { return caches[i].path < caches[j].path })
 
 	// Flatten into a fresh backing array: snapshots must never share entry
@@ -256,6 +323,30 @@ func loadAll(prev *Snapshot) *Snapshot {
 	}
 }
 
+// jobsMatchPrev reports whether every job matches a prev file with identical
+// path, size, and mtime. prev.files is sorted by path (snapshots sort their
+// caches before storing them), so each job's path is found with an
+// allocation-free binary search; a hit is then checked for size and mtime
+// equality. Called only after len(jobs) == len(prev.files) is known, so every
+// job matching a distinct prev entry means the sets are equal — nothing added,
+// removed, or changed. Zero allocation: the hot idle poll needs prevByPath and
+// caches, and this lets the short-circuit return before either is allocated.
+func jobsMatchPrev(jobs []loadJob, prevFiles []fileCache) bool {
+	for _, j := range jobs {
+		i := sort.Search(len(prevFiles), func(i int) bool {
+			return prevFiles[i].path >= j.path
+		})
+		if i >= len(prevFiles) || prevFiles[i].path != j.path {
+			return false
+		}
+		f := prevFiles[i]
+		if f.size != j.size || !f.modTime.Equal(j.modTime) {
+			return false
+		}
+	}
+	return true
+}
+
 // parsePending parses jobs with a bounded worker pool, appending one fileCache
 // per file to out. Per-file isolation: a bad file yields an empty cache, never
 // a failed load.
@@ -280,6 +371,12 @@ func parsePending(pending []loadJob, out *[]fileCache) {
 			defer wg.Done()
 			for j := range jobCh {
 				ents := parseFile(j.source, j.path)
+				// Per-file dedup: collapse intra-file replays before caching.
+				// Confluent with the later global pass (see fileCache doc), so
+				// the snapshot result is unchanged while the cache shrinks.
+				if len(ents) > 1 {
+					ents = dedupe(ents)
+				}
 				price(ents) // resolve costs once; reused files keep theirs
 				cacheCh <- fileCache{
 					path:    j.path,
@@ -301,13 +398,15 @@ func parsePending(pending []loadJob, out *[]fileCache) {
 	}
 }
 
-// parseFile parses one file with per-file error isolation.
+// parseFile parses one file with per-file error isolation. parseCalls only
+// increments once a registered source claims the file, so an unmatched source
+// name (which returns nil without parsing) never counts as a reparse.
 func parseFile(source, path string) []model.Entry {
-	parseCalls.Add(1)
 	for _, src := range sources.All() {
 		if src.Name != source {
 			continue
 		}
+		parseCalls.Add(1)
 		ents, err := src.Parse(path)
 		if err != nil {
 			return nil
@@ -340,17 +439,4 @@ func price(entries []model.Entry) {
 			e.MissingPricing = true
 		}
 	}
-}
-
-// DiscoverPaths is a small helper adapters may use for home-relative defaults.
-func DiscoverPaths(parts ...string) ([]string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	p := filepath.Join(append([]string{home}, parts...)...)
-	if fi, err := os.Stat(p); err == nil && fi.IsDir() {
-		return []string{p}, nil
-	}
-	return nil, nil
 }

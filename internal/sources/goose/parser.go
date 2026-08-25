@@ -1,6 +1,8 @@
 package goose
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"xusage/internal/model"
+	"xusage/internal/sources/adapter"
 )
 
 // createdAtJSON reads created_at loosely: goose exports may carry epoch
@@ -78,16 +81,20 @@ func Parse(path string) ([]model.Entry, error) {
 	return entries, nil
 }
 
-// decodeJSONL parses newline-delimited objects, skipping malformed lines.
+// decodeJSONL parses newline-delimited objects, skipping malformed lines. It
+// scans the raw bytes directly (no string copy + Split) and trims each line in
+// place, mirroring claude/codex streaming parsers.
 func decodeJSONL(data []byte) []sessionJSON {
 	var rows []sessionJSON
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.Contains(line, "\"") {
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 || !bytes.Contains(line, []byte(`"`)) {
 			continue
 		}
 		var row sessionJSON
-		if json.Unmarshal([]byte(line), &row) == nil && row.ID != "" {
+		if json.Unmarshal(line, &row) == nil && row.ID != "" {
 			rows = append(rows, row)
 		}
 	}
@@ -115,7 +122,7 @@ func rowToEntry(row *sessionJSON) (model.Entry, bool) {
 	if !ok || strings.TrimSpace(row.ID) == "" {
 		return model.Entry{}, false
 	}
-	modelName := parseModelConfig(row.ModelConfig)
+	modelName := adapter.Intern(parseModelConfig(row.ModelConfig))
 	if modelName == "" {
 		return model.Entry{}, false // query filters NULL/empty model configs
 	}

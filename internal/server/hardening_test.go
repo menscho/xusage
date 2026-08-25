@@ -262,6 +262,10 @@ func hermeticHome(t *testing.T) {
 		"COPILOT_OTEL_FILE_EXPORTER_PATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
 		"OPENCODE_DATA_DIR", "AMP_DIR", "CODEBUFF_DB_PATH", "DROID_SESSIONS_DIR",
 		"HERMES_HOME",
+		// Newly-added source adapters (must be cleared so a developer's real
+		// agent logs never leak into serve-level tests).
+		"AUGMENT_DATA_DIR", "CLINE_HOME", "CURSOR_HOME", "DEVIN_DATA_DIR",
+		"ROOCODE_DATA_DIR", "TRAE_DATA_DIR", "ZED_DATA_DIR", "XDG_CACHE_HOME",
 	} {
 		t.Setenv(env, "")
 	}
@@ -364,6 +368,12 @@ func TestRunWithInjectedInterrupt(t *testing.T) {
 	interrupt := make(chan struct{})
 	ready := make(chan string, 1)
 	errCh := make(chan error, 1)
+	// stop closes interrupt exactly once so runWithOptions always returns,
+	// even on an early failure below — otherwise its poller goroutine leaks
+	// into subsequent tests (StartPolling never stops a prior poller).
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(interrupt) }) }
+	defer stop()
 
 	go func() {
 		errCh <- runWithOptions(Options{
@@ -375,9 +385,11 @@ func TestRunWithInjectedInterrupt(t *testing.T) {
 	}()
 
 	var url string
+	readyTimer := time.NewTimer(5 * time.Second)
+	defer readyTimer.Stop()
 	select {
 	case url = <-ready:
-	case <-time.After(5 * time.Second):
+	case <-readyTimer.C:
 		t.Fatal("server never became ready")
 	}
 
@@ -393,13 +405,15 @@ func TestRunWithInjectedInterrupt(t *testing.T) {
 		t.Errorf("meta missing version: %v", metaPayload)
 	}
 
-	close(interrupt)
+	stop()
+	runTimer := time.NewTimer(5 * time.Second)
+	defer runTimer.Stop()
 	select {
 	case err := <-errCh:
 		if err != nil {
 			t.Fatalf("Run returned %v, want nil on interrupt", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-runTimer.C:
 		t.Fatal("Run did not shut down after interrupt")
 	}
 
@@ -415,6 +429,7 @@ func TestRunWithInjectedInterrupt(t *testing.T) {
 // (incremental cache), a touched file is reparsed while running, and after
 // shutdown further touches stay unparsed.
 func TestRunStopsPollerOnShutdown(t *testing.T) {
+	hermeticHome(t) // isolate from the developer's real agent logs
 	dir := hardeningFixtureCorpus(t)
 
 	// Find one corpus file to bump; the corpus always writes claude JSONL.
@@ -441,6 +456,12 @@ func TestRunStopsPollerOnShutdown(t *testing.T) {
 	interrupt := make(chan struct{})
 	ready := make(chan string, 1)
 	errCh := make(chan error, 1)
+	// stop closes interrupt exactly once so runWithOptions always returns,
+	// even on an early failure below — otherwise its poller goroutine leaks
+	// into subsequent tests (StartPolling never stops a prior poller).
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(interrupt) }) }
+	defer stop()
 	go func() {
 		errCh <- runWithOptions(Options{
 			Addr:           "127.0.0.1:0",
@@ -449,9 +470,11 @@ func TestRunStopsPollerOnShutdown(t *testing.T) {
 			OnReady:        func(url string) { ready <- url },
 		}, interrupt)
 	}()
+	readyTimer := time.NewTimer(5 * time.Second)
+	defer readyTimer.Stop()
 	select {
 	case <-ready:
-	case <-time.After(5 * time.Second):
+	case <-readyTimer.C:
 		t.Fatal("server never became ready")
 	}
 
@@ -488,13 +511,15 @@ func TestRunStopsPollerOnShutdown(t *testing.T) {
 		t.Fatal("poller never reparsed the touched file")
 	}
 
-	close(interrupt)
+	stop()
+	runTimer := time.NewTimer(5 * time.Second)
+	defer runTimer.Stop()
 	select {
 	case err := <-errCh:
 		if err != nil {
 			t.Fatalf("Run returned %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-runTimer.C:
 		t.Fatal("Run did not shut down after interrupt")
 	}
 

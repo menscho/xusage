@@ -1,6 +1,7 @@
 package kimi
 
 import (
+	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"xusage/internal/model"
+	"xusage/internal/sources/adapter"
 )
 
 const (
@@ -24,20 +26,13 @@ const (
 
 // wireLine is the subset of a Kimi wire JSONL line we consume.
 type wireLine struct {
-	Type string `json:"type"` // old format envelope / new format "usage.record"
-
-	// Old format: {"timestamp": <sec.f>, "message": {"type":"StatusUpdate",
-	//   "payload":{"token_usage":{...},"message_id":"..."}}}
-	Timestamp *float64     `json:"timestamp"`
-	Message   *wireMessage `json:"message"`
-
-	// New format: {"type":"usage.record","model":"kimi-code/...","time":<ms>,
-	//   "usage":{"inputOther":..,"output":..,"inputCacheCreation":..,
-	//            "inputCacheRead":..},"usageScope":"turn"}
-	Model      *string   `json:"model"`
-	Time       *int64    `json:"time"`
-	Usage      *newUsage `json:"usage"`
-	UsageScope string    `json:"usageScope"`
+	Type       string       `json:"type"`
+	Timestamp  *float64     `json:"timestamp"`
+	Message    *wireMessage `json:"message"`
+	Model      *string      `json:"model"`
+	Time       *int64       `json:"time"`
+	Usage      *newUsage    `json:"usage"`
+	UsageScope string       `json:"usageScope"`
 }
 
 // wireMessage covers both old-format message envelopes and the bare payload
@@ -49,7 +44,7 @@ type wireMessage struct {
 
 type wirePayloadRaw struct {
 	TokenUsage *tokenUsage `json:"token_usage"`
-	MessageID  *string     `json:"message_id"` // empty string means absent upstream
+	MessageID  *string     `json:"message_id"`
 }
 
 type tokenUsage struct {
@@ -85,25 +80,29 @@ type parsedEntry struct {
 //
 // Old format lines are StatusUpdate messages carrying token_usage; consecutive
 // updates collapse to the latest (each update reports cumulative turn usage).
-// New format lines are type=usage.record with usageScope=turn only —
+// New format lines are type=usage.record with usageScope=turn only --
 // session-scoped records are running totals and must not double count.
 func Parse(path string) ([]model.Entry, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+
 	fallback := fileModTime(path)
-	cfgModel := readConfiguredModel(path)
+	cfgModel := adapter.Intern(readConfiguredModel(path))
 	sessID := sessionIDFromPath(path)
 
 	var out []model.Entry
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
 		if line == "" ||
 			(!strings.Contains(line, `"token_usage"`) &&
 				!strings.Contains(line, `"usage.record"`) &&
 				!strings.Contains(line, `"usage"`)) {
-			continue // fast prefilter: skip non-usage lines without decoding
+			continue
 		}
 		e, ok := parseLine(line, fallback, cfgModel, sessID)
 		if ok {
@@ -145,7 +144,7 @@ func oldFormatEntry(wl *wireLine, fallback time.Time, cfgModel, sessID string) (
 	in, out, cc, cr, extra := splitTokens(tu.InputOther, tu.Output,
 		tu.InputCacheCreate, tu.InputCacheRead, tu.Total)
 	if in+out+cc+cr+extra == 0 {
-		return model.Entry{}, false // zero-usage updates carry no information
+		return model.Entry{}, false
 	}
 	ts := fallback
 	if wl.Timestamp != nil && isFinite(*wl.Timestamp) {
@@ -154,6 +153,7 @@ func oldFormatEntry(wl *wireLine, fallback time.Time, cfgModel, sessID string) (
 	return model.Entry{
 		ID:                  messageID(payload),
 		Timestamp:           ts.UTC(),
+		RawModel:            cfgModel,
 		Model:               cfgModel,
 		SessionID:           sessID,
 		InputTokens:         in,
@@ -176,7 +176,7 @@ func messageID(p *wirePayloadRaw) string {
 // newFormatEntry handles Kimi Code "usage.record" turn records.
 func newFormatEntry(wl *wireLine, fallback time.Time, sessID string) (model.Entry, bool) {
 	if !strings.EqualFold(wl.UsageScope, "turn") {
-		return model.Entry{}, false // session scope = cumulative snapshot
+		return model.Entry{}, false
 	}
 	u := wl.Usage
 	if u == nil {
@@ -188,18 +188,21 @@ func newFormatEntry(wl *wireLine, fallback time.Time, sessID string) (model.Entr
 		return model.Entry{}, false
 	}
 	ts := fallback
-	// Upstream reads time through lenient_i64: a negative value is absent and
-	// falls back to the file mtime instead of producing a pre-1970 stamp.
 	if wl.Time != nil && *wl.Time >= 0 {
 		ts = time.UnixMilli(*wl.Time)
 	}
+	rawModel := defaultModel
 	m := defaultModel
-	if wl.Model != nil && strings.TrimSpace(*wl.Model) != "" {
-		m = strings.TrimPrefix(strings.TrimSpace(*wl.Model), "kimi-code/")
+	if wl.Model != nil {
+		if trimmed := strings.TrimSpace(*wl.Model); trimmed != "" {
+			rawModel = trimmed
+			m = strings.TrimPrefix(trimmed, "kimi-code/")
+		}
 	}
 	return model.Entry{
 		Timestamp:           ts.UTC(),
-		Model:               m,
+		RawModel:            adapter.Intern(rawModel),
+		Model:               adapter.Intern(m),
 		SessionID:           sessID,
 		InputTokens:         in,
 		OutputTokens:        out,
@@ -251,15 +254,15 @@ func readConfiguredModel(wirePath string) string {
 // root/sessions/<group>/<session>/wire.jsonl (4 levels up) or
 // root/sessions/<ws>/<session>/agents/<agent>/wire.jsonl (5 levels up).
 func dataRootFromWirePath(wirePath string) (string, bool) {
-	levels := 4 // old layout: <session>, <group>, sessions, <root>
+	levels := 4
 	if filepath.Base(filepath.Dir(filepath.Dir(wirePath))) == agentsDir {
-		levels = 5 // new layout adds <agent> and "agents"
+		levels = 5
 	}
 	p := wirePath
 	for i := 0; i < levels; i++ {
 		next := filepath.Dir(p)
 		if next == p {
-			return "", false // hit the filesystem root before finishing
+			return "", false
 		}
 		p = next
 	}
@@ -268,9 +271,9 @@ func dataRootFromWirePath(wirePath string) (string, bool) {
 
 // sessionIDFromPath extracts the session directory name from either layout.
 func sessionIDFromPath(wirePath string) string {
-	dir := filepath.Dir(wirePath) // .../agents/<agent> | .../<session>
+	dir := filepath.Dir(wirePath)
 	if filepath.Base(filepath.Dir(dir)) == agentsDir {
-		dir = filepath.Dir(filepath.Dir(dir)) // step past <agent> and "agents"
+		dir = filepath.Dir(filepath.Dir(dir))
 	}
 	name := filepath.Base(dir)
 	if name == "." || name == string(filepath.Separator) || name == "/" {
@@ -287,8 +290,8 @@ func fileModTime(path string) time.Time {
 	return fi.ModTime()
 }
 
+// NaN fails every comparison; +-Inf overflow the int64 millisecond range.
 func isFinite(f float64) bool {
-	// NaN fails every comparison; ±Inf overflow the int64 millisecond range.
 	return f == f && f >= -9.2e18 && f <= 9.2e18
 }
 

@@ -5,16 +5,42 @@ package engine
 import (
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"xusage/internal/model"
-	"xusage/internal/pricing"
+)
+
+// vendorCache memoizes VendorOf results by model name. Model names are
+// interned by the engine (parse-time interning in every source), so the map
+// holds at most a few dozen entries for a lifetime process — bounded, never a
+// leak — and the vendor tables are static, so no eviction is ever needed.
+// Culling the per-call strings.ToLower allocation matters because callers
+// invoke VendorOf per-entry (ByVendor, vendor-filtered) over the whole corpus.
+var (
+	vendorCacheMu sync.RWMutex
+	vendorCache   = map[string]string{}
 )
 
 // VendorOf maps a display model name to its vendor family using the first
 // segment after any "host/model" prefix and a case-insensitive prefix match.
-// Unknown families report "Other" so the UI always has a bucket.
+// Unknown families report "Other" so the UI always has a bucket. Results are
+// memoized; the first call for a model allocates, every later hit is free.
 func VendorOf(modelName string) string {
+	vendorCacheMu.RLock()
+	v, ok := vendorCache[modelName]
+	vendorCacheMu.RUnlock()
+	if ok {
+		return v
+	}
+	v = vendorOf(modelName)
+	vendorCacheMu.Lock()
+	vendorCache[modelName] = v
+	vendorCacheMu.Unlock()
+	return v
+}
+
+func vendorOf(modelName string) string {
 	name := modelName
 	if i := strings.LastIndexAny(name, "/:"); i >= 0 && i+1 < len(name) {
 		name = name[i+1:] // "openrouter/deepseek/v3" and "gpt-4:2024" style ids
@@ -86,21 +112,35 @@ type VendorRow struct {
 
 // ByVendor rolls filtered entries up by VendorOf(Model), sorted by cost desc.
 // Share is each vendor's fraction of total cost.
+//
+// It iterates s.Entries inline through match() instead of materializing a
+// filtered []*model.Entry slice — the same pattern groupBy/ByModel/BySession/
+// ByProject/Summary use to skip the ~8 B/entry allocation that filtered()
+// performs. ByVendor was the last row endpoint still going through filtered();
+// closing that gap keeps every aggregator in the package on one code path.
 func (s *Snapshot) ByVendor(o *Opts) []VendorRow {
-	entries := s.filtered(o) // []*model.Entry
+	loc := o.loc()
+	since := parseDay(o.Since, loc)
+	until := parseDayEndExclusive(o.Until, loc)
+	interned := s.sessionsInterned()
 	type acc struct {
 		row       VendorRow
-		sessions  map[string]bool
+		sessions  map[int]bool // interned SessionIdx (or SessionID hashes below)
+		sessStr   map[string]bool
 		firstSeen map[string]int // model -> index into Models
 	}
 	groups := map[string]*acc{}
 	var order []string
 	var totalCost float64
-	for _, e := range entries {
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if !match(o, loc, since, until, e) {
+			continue
+		}
 		v := VendorOf(e.Model)
 		g := groups[v]
 		if g == nil {
-			g = &acc{sessions: map[string]bool{}, firstSeen: map[string]int{}}
+			g = &acc{firstSeen: map[string]int{}}
 			g.row.Key = v
 			g.row.Label = v
 			groups[v] = g
@@ -111,11 +151,22 @@ func (s *Snapshot) ByVendor(o *Opts) []VendorRow {
 		g.row.CacheCreationTokens += e.CacheCreationTokens + e.CacheCreation1h
 		g.row.CacheReadTokens += e.CacheReadTokens
 		g.row.ExtraTotalTokens += e.ExtraTotalTokens
-		g.row.Cost += e.Cost(o.Mode)
+		cost := e.Cost(o.Mode)
+		g.row.Cost += cost
 		g.row.Messages += int64(max(e.Messages, 1))
-		totalCost += e.Cost(o.Mode)
-		if e.SessionID != "" {
-			g.sessions[e.SessionID] = true
+		totalCost += cost
+		if interned {
+			if e.SessionIdx != 0 {
+				if g.sessions == nil {
+					g.sessions = map[int]bool{}
+				}
+				g.sessions[e.SessionIdx] = true
+			}
+		} else if e.SessionID != "" {
+			if g.sessStr == nil {
+				g.sessStr = map[string]bool{}
+			}
+			g.sessStr[e.SessionID] = true
 		}
 		idx, seen := g.firstSeen[e.Model]
 		if !seen {
@@ -129,7 +180,7 @@ func (s *Snapshot) ByVendor(o *Opts) []VendorRow {
 		mb.CacheCreationTokens += e.CacheCreationTokens + e.CacheCreation1h
 		mb.CacheReadTokens += e.CacheReadTokens
 		mb.ExtraTotalTokens += e.ExtraTotalTokens
-		mb.Cost += e.Cost(o.Mode)
+		mb.Cost += cost
 		if e.MissingPricing {
 			mb.MarkMissingPricing()
 		}
@@ -139,7 +190,11 @@ func (s *Snapshot) ByVendor(o *Opts) []VendorRow {
 		g := groups[v]
 		g.row.TotalTokens = g.row.InputTokens + g.row.OutputTokens +
 			g.row.CacheCreationTokens + g.row.CacheReadTokens + g.row.ExtraTotalTokens
-		g.row.Sessions = int64(len(g.sessions))
+		sessions := len(g.sessions)
+		if sessions == 0 && len(g.sessStr) > 0 {
+			sessions = len(g.sessStr)
+		}
+		g.row.Sessions = int64(sessions)
 		if totalCost > 0 {
 			g.row.Share = g.row.Cost / totalCost
 		}
@@ -183,19 +238,96 @@ type ModelDetail struct {
 	Models              []model.ModelBreakdown `json:"models,omitempty"` // nil for model rows
 }
 
+// trendKey identifies one cached 7-day trend: the snapshot it was computed
+// against plus the model name. The snapshot pointer is part of the key so a
+// stale trend computed for snapshot S is never served after the poller swaps
+// in S'. That also bounds the cache: a snapshot change bumps gen, which
+// invalidates every entry at once instead of leaking trends for models the
+// user collapsed and never reopened.
+type trendKey struct {
+	snap  *Snapshot
+	model string
+}
+
+// trendMemo holds computed Trend7 slices for the current snapshot. get/set
+// take the snapshot pointer as a generation guard: the first get against a
+// new snapshot clears the whole map, so memory is bounded to the models of
+// whichever snapshot is live (at most a handful of trend slices, each 7 points)
+// plus the entries queued by concurrent readers during the swap window.
+type trendMemo struct {
+	mu   sync.Mutex
+	snap *Snapshot
+	loc  *time.Location
+	m    map[trendKey][]TrendPoint
+	days []string
+	win  int64
+}
+
+var trendCache trendMemo
+
+func (c *trendMemo) get(snap *Snapshot, model string) ([]TrendPoint, bool) {
+	c.mu.Lock()
+	if c.snap != snap {
+		c.snap = snap
+		c.m = map[trendKey][]TrendPoint{}
+	}
+	v, ok := c.m[trendKey{snap, model}]
+	c.mu.Unlock()
+	return v, ok
+}
+
+func (c *trendMemo) put(snap *Snapshot, model string, v []TrendPoint) {
+	c.mu.Lock()
+	if c.snap == snap {
+		c.m[trendKey{snap, model}] = v
+	}
+	c.mu.Unlock()
+}
+
+// daysFor returns the 7-day label slice (today-6..today) and the window-start
+// bucket for (snap, loc), computing and caching them on first use. The slice
+// and winStart are reused across calls for the same (snapshot, timezone), so
+// the per-request make+Format allocation is paid at most once per (snap, loc)
+// instead of on every /api/models request. It also establishes the
+// (snapshot, timezone) generation for the whole trendMemo: a loc change clears
+// the trend map so trends computed against a different timezone's winStart are
+// never served. Callers must invoke daysFor before get/put in the trend path.
+func (c *trendMemo) daysFor(snap *Snapshot, loc *time.Location) ([]string, int64) {
+	c.mu.Lock()
+	if c.snap != snap || c.loc != loc {
+		c.snap = snap
+		c.loc = loc
+		c.m = map[trendKey][]TrendPoint{}
+		c.days = nil
+		c.win = 0
+	}
+	if c.days == nil {
+		today := time.Now().In(loc)
+		days := make([]string, 7)
+		for i := 0; i < 7; i++ {
+			days[i] = today.AddDate(0, 0, i-6).Format("2006-01-02")
+		}
+		c.days = days
+		c.win = dayBucket(today) - 6
+	}
+	days := c.days
+	win := c.win
+	c.mu.Unlock()
+	return days, win
+}
+
 // ModelsDetailed is the redesigned /api/models payload. With trend=true each
 // row carries a zero-filled Trend7 ending today (snapshot tz). Vendor filter
 // applies via Opts.Vendor; share is cost fraction across returned rows.
+//
+// Trend computation is single-pass: one scan of s.Entries fills every model's
+// 7-day buckets, then each row reads its slice out of trendCache. The scan is
+// skipped entirely when all requested trends are already cached for this
+// snapshot. Per-row allocations are avoided: the days/dayIndex window is built
+// once, the zero-filled TrendPoint template is built once and reused for rows
+// with no activity in the window, and details is pre-sized to len(rows).
 func (s *Snapshot) ModelsDetailed(o *Opts, trend bool) []ModelDetail {
 	loc := o.loc()
-	today := time.Now().In(loc)
-	days := make([]string, 7)
-	dayIndex := map[string]int{}
-	for i := 0; i < 7; i++ {
-		d := today.AddDate(0, 0, i-6)
-		days[i] = d.Format("2006-01-02")
-		dayIndex[days[i]] = i
-	}
 
 	rows := s.ByModel(o)
 	details := make([]ModelDetail, 0, len(rows))
@@ -203,6 +335,23 @@ func (s *Snapshot) ModelsDetailed(o *Opts, trend bool) []ModelDetail {
 	for _, r := range rows {
 		totalCost += r.Cost
 	}
+
+	// Ensure every requested model has a cached trend before assembling rows.
+	// days/winStart are cached per (snapshot, timezone) by trendCache.daysFor,
+	// so the per-request make+Format allocation is paid once per (snap, loc)
+	// instead of on every /api/models call. daysFor also establishes the
+	// (snapshot, timezone) generation for the whole trendMemo (clearing trends
+	// computed against a different timezone's window), so it must run before
+	// ensureTrends/get below. ensureTrends caches a (possibly zero-filled)
+	// Trend7 for each model in rows, so the loop reads its slice by reference
+	// with no per-row allocation; a cache hit also skips the entry scan.
+	var days []string
+	var winStart int64
+	if trend {
+		days, winStart = trendCache.daysFor(s, loc)
+		s.ensureTrends(rows, o, loc, days, winStart)
+	}
+
 	for _, r := range rows {
 		d := ModelDetail{
 			Key:                 r.Key,
@@ -218,28 +367,94 @@ func (s *Snapshot) ModelsDetailed(o *Opts, trend bool) []ModelDetail {
 			Sessions:            r.Sessions,
 			FirstActivity:       r.FirstActivity,
 			LastActivity:        r.LastActivity,
-			MissingPricing:      !pricing.Get().Known(r.Key) && r.TotalTokens() > 0,
+			// ByModel already marks the per-model breakdown's MissingPricing
+			// flag from entry-level pricing state (aggregate.go); reuse it
+			// instead of a redundant per-row pricing.Get().Known lookup.
+			MissingPricing: len(r.Models) > 0 && r.Models[0].MissingPricing,
 		}
 		if totalCost > 0 {
 			d.Share = r.Cost / totalCost
 		}
 		if trend {
-			d.Trend7 = make([]TrendPoint, 7)
-			for i, day := range days {
-				d.Trend7[i] = TrendPoint{Date: day}
-			}
-			for i := range s.Entries {
-				e := &s.Entries[i]
-				if e.Model != r.Key {
-					continue
-				}
-				if idx, ok := dayIndex[e.Timestamp.In(loc).Format("2006-01-02")]; ok {
-					d.Trend7[idx].Tokens += e.TotalTokens()
-					d.Trend7[idx].Cost += e.Cost(o.Mode)
-				}
-			}
+			d.Trend7, _ = trendCache.get(s, r.Key)
 		}
 		details = append(details, d)
 	}
 	return details
+}
+
+// trendAccum is the mutable per-model scratch for a single trend scan. Using a
+// fixed [7] backing array keeps the accumulation off the per-entry heap.
+type trendAccum struct {
+	tokens [7]uint64
+	cost   [7]float64
+}
+
+// ensureTrends guarantees a cached Trend7 for every model in rows. It runs one
+// pass over s.Entries, accumulating into per-model [7] arrays keyed by the
+// model names actually requested, then writes a Trend7 slice to trendCache for
+// each. Models already cached for this snapshot are left untouched, so
+// repeated calls for overlapping model sets only scan the new ones. Snapshot
+// identity is the invalidation signal: trendCache is cleared on swap.
+func (s *Snapshot) ensureTrends(rows []model.Row, o *Opts, loc *time.Location, days []string, winStart int64) {
+	// Collect models not yet cached for this snapshot so we don't recompute
+	// them. Lazily allocated (nil until first miss): a fully-cached call (the
+	// common case once trends are warm) allocates nothing here, so the
+	// poll-time /api/models path zeroes its scratch on the hot hit branch.
+	var needed []model.Row
+	for _, r := range rows {
+		if _, ok := trendCache.get(s, r.Key); !ok {
+			needed = append(needed, r)
+		}
+	}
+	if len(needed) == 0 {
+		return
+	}
+
+	// Restrict accumulation to the models we actually need: a model present in
+	// the snapshot but not in the current filtered view is skipped, which both
+	// saves work and keeps the per-scan map small.
+	needSet := make(map[string]struct{}, len(needed))
+	for _, r := range needed {
+		needSet[r.Key] = struct{}{}
+	}
+
+	acc := make(map[string]*trendAccum, len(needed))
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if _, ok := needSet[e.Model]; !ok {
+			continue
+		}
+		a := acc[e.Model]
+		if a == nil {
+			a = &trendAccum{}
+			acc[e.Model] = a
+		}
+		// dayBucket is allocation-free civil-day-index arithmetic; the offset
+		// from winStart is the 0..6 bucket index. Entries outside the 7-day
+		// window (or with a zero-valued Timestamp) fall through.
+		if idx := dayBucket(e.Timestamp.In(loc)) - winStart; idx >= 0 && idx < 7 {
+			a.tokens[idx] += e.TotalTokens()
+			a.cost[idx] += e.Cost(o.Mode)
+		}
+	}
+
+	for _, r := range needed {
+		a, ok := acc[r.Key]
+		if !ok {
+			// Model has zero entries in the window: emit a zero-filled slice so
+			// the row always carries a well-formed Trend7 when trend=true.
+			tp := make([]TrendPoint, 7)
+			for i := range days {
+				tp[i] = TrendPoint{Date: days[i]}
+			}
+			trendCache.put(s, r.Key, tp)
+			continue
+		}
+		tp := make([]TrendPoint, 7)
+		for i := range days {
+			tp[i] = TrendPoint{Date: days[i], Tokens: a.tokens[i], Cost: a.cost[i]}
+		}
+		trendCache.put(s, r.Key, tp)
+	}
 }

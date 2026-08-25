@@ -6,11 +6,11 @@ import (
 	"xusage/internal/sources"
 )
 
-func TestAllSixteenRegistered(t *testing.T) {
+func TestAllRegistered(t *testing.T) {
 	want := []string{
-		"amp", "claude", "codebuff", "codex", "copilot", "droid", "gemini",
-		"goose", "grok", "hermes", "kilo", "kimi", "openclaw", "opencode",
-		"pi", "qwen",
+		"amp", "augment", "claude", "cline", "codebuff", "codex", "copilot",
+		"cursor", "devin", "droid", "gemini", "goose", "grok", "hermes", "kilo",
+		"kimi", "openclaw", "opencode", "pi", "qwen", "roocode", "trae", "zed",
 	}
 	got := sources.Names()
 	if len(got) != len(want) {

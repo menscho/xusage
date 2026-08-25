@@ -6,10 +6,14 @@ package all
 
 import (
 	_ "xusage/internal/sources/amp"
+	_ "xusage/internal/sources/augment"
 	_ "xusage/internal/sources/claude"
+	_ "xusage/internal/sources/cline"
 	_ "xusage/internal/sources/codebuff"
 	_ "xusage/internal/sources/codex"
 	_ "xusage/internal/sources/copilot"
+	_ "xusage/internal/sources/cursor"
+	_ "xusage/internal/sources/devin"
 	_ "xusage/internal/sources/droid"
 	_ "xusage/internal/sources/gemini"
 	_ "xusage/internal/sources/goose"
@@ -21,4 +25,7 @@ import (
 	_ "xusage/internal/sources/opencode"
 	_ "xusage/internal/sources/pi"
 	_ "xusage/internal/sources/qwen"
+	_ "xusage/internal/sources/roocode"
+	_ "xusage/internal/sources/trae"
+	_ "xusage/internal/sources/zed"
 )

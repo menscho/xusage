@@ -1,6 +1,7 @@
 package qwen
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"xusage/internal/model"
+	"xusage/internal/sources/adapter"
 	"xusage/internal/sources/jsonx"
 )
 
@@ -47,7 +49,7 @@ func parseFile(path string) []model.Entry {
 		if rec.Type != "assistant" {
 			return true
 		}
-		if len(rec.UsageMetadata) == 0 || string(rec.UsageMetadata) == "null" {
+		if len(rec.UsageMetadata) == 0 || bytes.Equal(rec.UsageMetadata, []byte("null")) {
 			return true
 		}
 		var u usageMetadata
@@ -58,17 +60,18 @@ func parseFile(path string) []model.Entry {
 		output := u.CandidatesTokenCount
 		cacheRead := min64(u.CachedContentTokenCount, input)
 		reasoning := u.ThoughtsTokenCount
+		m := adapter.Intern(rec.Model)
 		e := model.Entry{
 			Timestamp:       timestampOf(rec.Timestamp, path),
-			RawModel:        rec.Model,
-			Model:           rec.Model,
+			RawModel:        m,
+			Model:           m,
 			Project:         project,
 			InputTokens:     input,
 			OutputTokens:    output,
 			CacheReadTokens: cacheRead,
 			Messages:        1,
 		}
-		if e.RawModel == "" {
+		if m == "" {
 			e.RawModel = "unknown"
 			e.Model = "unknown"
 		}
@@ -94,12 +97,8 @@ func parseFile(path string) []model.Entry {
 // timestampOf parses the record timestamp; a missing or invalid stamp falls
 // back to the file's modification time so entries still land on a day.
 func timestampOf(ts, path string) time.Time {
-	// Upstream parse_ts_timestamp accepts only RFC3339-shaped strings; a bare
-	// numeric string is not a valid stamp and falls back to the file mtime.
-	if looksRFC3339(ts) {
-		if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(ts)); err == nil {
-			return t.UTC()
-		}
+	if t, ok := parseRFC3339(ts); ok {
+		return t.UTC()
 	}
 	if fi, err := os.Stat(path); err == nil {
 		return fi.ModTime().UTC()
@@ -107,11 +106,18 @@ func timestampOf(ts, path string) time.Time {
 	return time.Unix(0, 0).UTC()
 }
 
-// looksRFC3339 reports whether s parses as an RFC 3339 timestamp, matching
-// upstream parse_ts_timestamp's accepted shape for qwen record stamps.
-func looksRFC3339(s string) bool {
-	_, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(s))
-	return err == nil
+// parseRFC3339 parses an RFC3339-shaped timestamp the way upstream
+// parse_ts_timestamp does, returning the time and whether it parsed. Trimming
+// once up front avoids the previous double trim+parse per record.
+func parseRFC3339(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 func min64(a, b uint64) uint64 {

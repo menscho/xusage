@@ -1,92 +1,104 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#0a0a0a">
-  <title>xusage</title>
-  <!-- Google Fonts is a progressive enhancement (SPEC §13.0): offline the
-       system fallbacks in --font/--mono render cleanly. -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/css/style.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230a0a0a'/%3E%3Crect x='3.5' y='3.5' width='9' height='9' rx='2' fill='%234a9eff'/%3E%3C/svg%3E">
-  <!-- charts.js + app.js own the frozen XUChart / XU globals; views register
-       themselves against XU and must load after it. -->
-  <script src="/js/charts.js" defer></script>
-  <script src="/js/app.js" defer></script>
-  <script src="/js/view_overview.js" defer></script>
-  <script src="/js/view_leaderboard.js" defer></script>
-  <script src="/js/view_share.js" defer></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0a0b">
+<title>xusage</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
-  <a class="skip-link" href="#view">Skip to content</a>
 
-  <header class="topbar">
-    <div class="brand">
-      <svg class="brand-logo" viewBox="0 0 16 16" width="20" height="20" aria-hidden="true">
-        <rect x="0.5" y="0.5" width="15" height="15" rx="3" fill="#0a0a0a" stroke="#1e1e1e" stroke-width="1"/>
-        <rect x="4" y="4" width="8" height="8" rx="1.5" fill="#4a9eff"/>
-      </svg>
-      <span class="brand-name">xusage</span>
-      <span class="brand-tag" id="brand-tag">vdev</span>
+<!-- skip -->
+<a class="skip" href="#panel">Skip to panel</a>
+
+<!-- ── topbar ─────────────────────────────────────────────── -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark"></span>
+    <span class="brand-word">xusage</span>
+  </div>
+
+  <div class="topbar-right">
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<!-- ── shell: rail + panel ───────────────────────────────── -->
+<div class="shell">
+
+  <!-- rail -->
+  <nav class="rail" id="rail" aria-label="views">
+    <div class="rail-group">
+      <span class="rail-label">summary</span>
+      <button class="rail-item active" data-route="overview">
+        <span>Overview</span>
+      </button>
+      <button class="rail-item" data-route="timeline">
+        <span>Timeline</span>
+      </button>
+    </div>
+    <div class="rail-group">
+      <span class="rail-label">breakdown</span>
+      <button class="rail-item" data-route="models">
+        <span>Models</span>
+      </button>
+      <button class="rail-item" data-route="agents">
+        <span>Agents</span>
+      </button>
+    </div>
+    <div class="rail-group">
+      <span class="rail-label">monitor</span>
+      <button class="rail-item" data-route="live">
+        <span>Live</span>
+      </button>
     </div>
 
-    <nav class="nav" id="nav" aria-label="Views">
-      <a href="#/overview" data-view="overview">Overview</a>
-      <a href="#/leaderboard" data-view="leaderboard">Leaderboard</a>
-      <a href="#/share" data-view="share">Share</a>
-    </nav>
-
-    <div class="top-right">
-      <span class="clock" id="clock"></span>
+    <div class="rail-foot">
+      <div class="rail-stat">
+        <span class="rail-stat-key">window</span>
+        <span class="rail-stat-val" id="rail-window">7d</span>
+      </div>
+      <div class="rail-stat">
+        <span class="rail-stat-key">updated</span>
+        <span class="rail-stat-val" id="rail-updated">—</span>
+      </div>
     </div>
-  </header>
+  </nav>
 
-  <main class="wrap">
-    <div class="controls" id="controls">
-      <div class="seg" id="seg-range" role="group" aria-label="Date range">
-        <button type="button" class="seg-btn" data-range="1d">1d</button>
-        <button type="button" class="seg-btn" data-range="3d">3d</button>
-        <button type="button" class="seg-btn active" data-range="7d">7d</button>
-        <button type="button" class="seg-btn" data-range="30d">30d</button>
-        <button type="button" class="seg-btn" data-range="90d">90d</button>
-        <button type="button" class="seg-btn" data-range="all">All</button>
+  <!-- panel -->
+  <main class="panel" id="panel">
+
+    <!-- controls -->
+    <div class="controls">
+      <div class="seg" role="group" aria-label="range" id="seg-range">
+        <button data-range="1d">1d</button>
+        <button data-range="7d" class="active">7d</button>
+        <button data-range="30d">30d</button>
+        <button data-range="90d">90d</button>
+        <button data-range="all">all</button>
       </div>
-
-      <div class="seg" id="seg-mode" role="group" aria-label="Cost mode">
-        <button type="button" class="seg-btn active" data-mode="auto">Auto</button>
-        <button type="button" class="seg-btn" data-mode="display">Reported</button>
-        <button type="button" class="seg-btn" data-mode="calculate">Calc</button>
+      <div class="seg" role="group" aria-label="metric" id="seg-metric">
+        <button data-metric="tokens" class="active">tokens</button>
+        <button data-metric="cost">$ cost</button>
+        <button data-metric="calls">calls</button>
       </div>
-
-      <div class="seg" id="seg-tz" role="group" aria-label="Timezone">
-        <button type="button" class="seg-btn active" data-tz="local">Local</button>
-        <button type="button" class="seg-btn" data-tz="utc">UTC</button>
-      </div>
-
-      <span class="prov-chip" id="prov-chip" hidden>
-        <i></i><span class="prov-chip-val"></span>
-        <button type="button" class="prov-chip-x" aria-label="Clear provider filter">&times;</button>
-      </span>
-
-      <span class="ctl-spacer"></span>
-
-      <span class="updated" id="updated"></span>
+      <button class="btn" id="export-btn">Export CSV</button>
     </div>
 
-    <div id="view" class="content"></div>
+    <!-- view mount -->
+    <section class="view" id="view"></section>
+
   </main>
+</div>
 
-  <footer class="footer"></footer>
+<!-- toast port -->
+<div class="toast" id="toast" role="status"></div>
 
-  <div class="tooltip" id="tooltip" role="status"></div>
-  <div class="toast" id="toast" role="status"></div>
-
-  <noscript>
-    <div class="noscript">xusage requires JavaScript.</div>
-  </noscript>
+<script src="/js/app.js" defer></script>
 </body>
 </html>

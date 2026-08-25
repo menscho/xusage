@@ -39,12 +39,51 @@ func (o *Opts) loc() *time.Location {
 	return time.Local
 }
 
+// match reports whether entry e passes the filter options o within the
+// precomputed [since, until) bounds (in loc). Kept as one shared predicate so
+// filtered() and the inline aggregator loops below never diverge on filter
+// rules. Returns false on the first failing clause, so the common no-filter
+// path does only the two timestamp checks per entry.
+func match(o *Opts, loc *time.Location, since, until time.Time, e *model.Entry) bool {
+	if o.Project != "" {
+		p := e.Project
+		if p == "" {
+			p = noProjectKey // ByProject groups unattributed entries under this key
+		}
+		if p != o.Project {
+			return false
+		}
+	}
+	if o.Session != "" && e.SessionID != o.Session {
+		return false
+	}
+	if o.Model != "" && e.Model != o.Model {
+		return false
+	}
+	if o.Provider != "" && e.Provider != o.Provider {
+		return false
+	}
+	if o.Vendor != "" && VendorOf(e.Model) != o.Vendor {
+		return false
+	}
+	if !since.IsZero() && e.Timestamp.Before(since) {
+		return false
+	}
+	if !until.IsZero() && !e.Timestamp.Before(until) {
+		return false
+	}
+	return true
+}
+
 // filtered returns the snapshot entries passing the Opts filters, in order.
-// It yields index slices into the snapshot instead of copying whole Entry
+// It yields pointers into the snapshot instead of copying whole Entry
 // structs: aggregators only ever read through these pointers and never sort
-// or mutate the snapshot's backing array, so no aliasing hazard exists — and
-// skipping the per-request copy keeps warm API responses allocation-light
-// (SPEC §10 warm p99 budget).
+// or mutate the snapshot's backing array, so no aliasing hazard exists.
+// Today only tests materialize the full match set through this helper: every
+// production aggregator (daily…summary, ByVendor, blocks) iterates s.Entries
+// inline through match() to skip the intermediate slice — a []*model.Entry
+// sized to the whole snapshot was the largest per-request allocation on the
+// row endpoints (~8 B/entry), which is why the inline path is the default.
 func (s *Snapshot) filtered(o *Opts) []*model.Entry {
 	loc := o.loc()
 	since := parseDay(o.Since, loc)
@@ -52,34 +91,9 @@ func (s *Snapshot) filtered(o *Opts) []*model.Entry {
 	out := make([]*model.Entry, 0, len(s.Entries))
 	for i := range s.Entries {
 		e := &s.Entries[i]
-		if o.Project != "" {
-			p := e.Project
-			if p == "" {
-				p = noProjectKey // ByProject groups unattributed entries under this key
-			}
-			if p != o.Project {
-				continue
-			}
+		if match(o, loc, since, until, e) {
+			out = append(out, e)
 		}
-		if o.Session != "" && e.SessionID != o.Session {
-			continue
-		}
-		if o.Model != "" && e.Model != o.Model {
-			continue
-		}
-		if o.Provider != "" && e.Provider != o.Provider {
-			continue
-		}
-		if o.Vendor != "" && VendorOf(e.Model) != o.Vendor {
-			continue
-		}
-		if !since.IsZero() && e.Timestamp.Before(since) {
-			continue
-		}
-		if !until.IsZero() && !e.Timestamp.Before(until) {
-			continue
-		}
-		out = append(out, e)
 	}
 	return out
 }
@@ -237,14 +251,20 @@ func (s *Snapshot) sessionsInterned() bool {
 // each display key is rendered exactly once per group. Sessions counts
 // distinct SessionIDs per group. Last truncates to the n most recent
 // (highest-bucket) groups after sorting.
-func (s *Snapshot) groupBy(entries []*model.Entry, o *Opts,
+func (s *Snapshot) groupBy(o *Opts,
 	bucket func(*model.Entry, *time.Location) int64, label func(int64) string,
 ) []model.Row {
 	loc := o.loc()
+	since := parseDay(o.Since, loc)
+	until := parseDayEndExclusive(o.Until, loc)
 	groups := map[int64]*acc{}
 	sets := newSessionSets[int64](s.sessionsInterned())
 	var keys []int64
-	for _, e := range entries {
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if !match(o, loc, since, until, e) {
+			continue
+		}
 		k := bucket(e, loc)
 		a, ok := groups[k]
 		if !ok {
@@ -352,28 +372,28 @@ func monthLabel(k int64) string {
 
 // Daily aggregates by calendar day in the option timezone.
 func (s *Snapshot) Daily(o *Opts) []model.Row {
-	return s.groupBy(s.filtered(o), o, func(e *model.Entry, loc *time.Location) int64 {
+	return s.groupBy(o, func(e *model.Entry, loc *time.Location) int64 {
 		return dayBucket(e.Timestamp.In(loc))
 	}, dayLabel)
 }
 
 // Weekly aggregates by Monday-start week; Key is the week's Monday date.
 func (s *Snapshot) Weekly(o *Opts) []model.Row {
-	return s.groupBy(s.filtered(o), o, func(e *model.Entry, loc *time.Location) int64 {
+	return s.groupBy(o, func(e *model.Entry, loc *time.Location) int64 {
 		return weekBucket(e.Timestamp.In(loc))
 	}, weekLabel)
 }
 
 // Monthly aggregates by calendar month; Key is "2006-01".
 func (s *Snapshot) Monthly(o *Opts) []model.Row {
-	return s.groupBy(s.filtered(o), o, func(e *model.Entry, loc *time.Location) int64 {
+	return s.groupBy(o, func(e *model.Entry, loc *time.Location) int64 {
 		return monthBucket(e.Timestamp.In(loc))
 	}, monthLabel)
 }
 
 // Hourly aggregates by hour; Key is "2006-01-02 15" (24×N grid for heatmaps).
 func (s *Snapshot) Hourly(o *Opts) []model.Row {
-	return s.groupBy(s.filtered(o), o, func(e *model.Entry, loc *time.Location) int64 {
+	return s.groupBy(o, func(e *model.Entry, loc *time.Location) int64 {
 		return hourBucket(e.Timestamp.In(loc))
 	}, hourLabel)
 }
@@ -382,14 +402,20 @@ func (s *Snapshot) Hourly(o *Opts) []model.Row {
 // broken by session ID for determinism). Label carries the project of the
 // session's most recent entry.
 func (s *Snapshot) BySession(o *Opts) []model.Row {
-	entries := s.filtered(o)
+	loc := o.loc()
+	since := parseDay(o.Since, loc)
+	until := parseDayEndExclusive(o.Until, loc)
 	type meta struct {
 		project string
 		at      time.Time
 	}
 	groups := map[string]*acc{}
 	latest := map[string]meta{}
-	for _, e := range entries {
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if !match(o, loc, since, until, e) {
+			continue
+		}
 		id := e.SessionID
 		if id == "" {
 			id = "(no session)"
@@ -429,10 +455,16 @@ func (s *Snapshot) BySession(o *Opts) []model.Row {
 // ByProject aggregates per project, sorted by cost descending (ties broken by
 // project name). Sessions counts distinct session IDs per project.
 func (s *Snapshot) ByProject(o *Opts) []model.Row {
-	entries := s.filtered(o)
+	loc := o.loc()
+	since := parseDay(o.Since, loc)
+	until := parseDayEndExclusive(o.Until, loc)
 	groups := map[string]*acc{}
 	sets := newSessionSets[string](s.sessionsInterned())
-	for _, e := range entries {
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if !match(o, loc, since, until, e) {
+			continue
+		}
 		p := e.Project
 		if p == "" {
 			p = noProjectKey
@@ -470,7 +502,9 @@ func (s *Snapshot) ByProject(o *Opts) []model.Row {
 // row endpoints share one shape; per-model cost share is derivable client-side
 // from Cost against the set of rows.
 func (s *Snapshot) ByModel(o *Opts) []model.Row {
-	entries := s.filtered(o)
+	loc := o.loc()
+	since := parseDay(o.Since, loc)
+	until := parseDayEndExclusive(o.Until, loc)
 	interned := s.sessionsInterned()
 	type m struct {
 		b         model.ModelBreakdown
@@ -481,7 +515,11 @@ func (s *Snapshot) ByModel(o *Opts) []model.Row {
 		messages  int64
 	}
 	groups := map[string]*m{}
-	for _, e := range entries {
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if !match(o, loc, since, until, e) {
+			continue
+		}
 		g := groups[e.Model]
 		if g == nil {
 			g = &m{}
@@ -577,20 +615,39 @@ type ProviderBreakdown struct {
 // Summary computes the grand totals over filtered entries. Per-provider
 // sessions count distinct session IDs, not raw events.
 func (s *Snapshot) Summary(o *Opts) Summary {
-	entries := s.filtered(o)
 	loc := o.loc()
+	since := parseDay(o.Since, loc)
+	until := parseDayEndExclusive(o.Until, loc)
 	interned := s.sessionsInterned()
 	var sum Summary
-	sessionsIdx := map[int]bool{}
-	sessionsStr := map[string]bool{}
+	// Only one of each pair below is ever written (gated by interned in the
+	// loop); lazily allocating that one avoids a dead empty-map allocation on
+	// the other branch per Summary call. len on the untouched nil map is 0, so
+	// the totals computed below stay correct without the pre-sized empty maps.
+	var sessionsIdx map[int]bool
+	var sessionsStr map[string]bool
+	if interned {
+		sessionsIdx = map[int]bool{}
+	} else {
+		sessionsStr = map[string]bool{}
+	}
 	perProvider := map[string]*ProviderBreakdown{}
-	providerSessions := map[string]map[int]bool{}
-	providerSessionsStr := map[string]map[string]bool{}
+	var providerSessions map[string]map[int]bool
+	var providerSessionsStr map[string]map[string]bool
+	if interned {
+		providerSessions = map[string]map[int]bool{}
+	} else {
+		providerSessionsStr = map[string]map[string]bool{}
+	}
 	models := map[string]bool{}
 	days := map[int64]bool{} // civil-day buckets, labels rendered once below
 	var dayCount int64
 	var firstDay, lastDay int64
-	for _, e := range entries {
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if !match(o, loc, since, until, e) {
+			continue
+		}
 		sum.InputTokens += e.InputTokens
 		sum.OutputTokens += e.OutputTokens
 		sum.CacheCreationTokens += e.CacheCreationTokens + e.CacheCreation1h

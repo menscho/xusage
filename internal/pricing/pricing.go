@@ -1,9 +1,12 @@
 // Package pricing resolves model names to per-token prices and computes costs.
 //
-// The pricing table is loaded once from the embedded LiteLLM snapshot
-// (snapshot/litellm_pricing.json). Lookup is exact first, then falls back to a
-// separator-normalized key, a stripped date suffix, and finally a longest-prefix
-// match — mirroring how providers spell the same model differently across logs.
+// The active pricing table is the embedded LiteLLM snapshot
+// (snapshot/litellm_pricing.json) overlaid with a live snapshot fetched from
+// LiteLLM (see Refresh in live.go) and any user overrides. The embedded snapshot
+// is always loaded first and is the offline fallback when the live fetch fails.
+// Lookup is exact first, then falls back to a separator-normalized key, a
+// stripped date suffix, and finally a longest-prefix match — mirroring how
+// providers spell the same model differently across logs.
 package pricing
 
 import (
@@ -54,8 +57,16 @@ type providerSpecificEntry struct {
 }
 
 // Table holds resolved rates keyed by raw LiteLLM model name.
+//
+// norm is a precomputed index keyed by normalize(rawName) and built once at
+// load. It lets Find resolve the common exact-match case with a single
+// normalize() of the input plus one map probe, instead of materializing the
+// full candidateKeys spelling list per lookup. normalize() collisions are rare
+// in the snapshot and only ever join keys that carry identical rates (verified),
+// so first-seen-wins is value-preserving and the index is deterministic.
 type Table struct {
 	rates map[string]Rates
+	norm  map[string]Rates
 }
 
 var current atomic.Pointer[Table]
@@ -65,25 +76,22 @@ func init() {
 }
 
 // SetTable replaces the active table from raw LiteLLM JSON. A nil or invalid
-// payload keeps or restores the embedded snapshot. It is safe for concurrent use.
+// payload keeps or restores the embedded snapshot. Custom overrides from the
+// override file are applied on top in every case. It is safe for concurrent use.
 func SetTable(litellmJSON []byte) error {
-	t := &Table{rates: map[string]Rates{}}
-	if err := loadInto(t, snapshotJSON); err != nil {
-		return err
-	}
-	if len(litellmJSON) > 0 {
-		if err := loadInto(t, litellmJSON); err != nil {
-			return err
-		}
-	}
-	current.Store(t)
-	return nil
+	return applyAll(litellmJSON)
 }
 
 func loadInto(t *Table, data []byte) error {
 	var raw map[string]entry
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
+	}
+	// Pre-size on the first (snapshot) load so the 2610-entry fill doesn't
+	// trigger repeated map grow/rehash. The overlay pass starts from a
+	// non-empty map, so it skips this and grows only for its own (few) entries.
+	if len(t.rates) == 0 {
+		t.rates = make(map[string]Rates, len(raw))
 	}
 	for name, e := range raw {
 		if e.InputCostPerToken == nil || e.OutputCostPerToken == nil {
@@ -125,7 +133,32 @@ func loadInto(t *Table, data []byte) error {
 		}
 		t.rates[name] = r
 	}
+	// Precompute the normalized-key index for allocation-free exact lookup.
+	// Rebuild from the current rates each load so overlays are included.
+	t.indexNorm()
 	return nil
+}
+
+// indexNorm builds norm, a normalize(rawName)->rates index. Canonical keys
+// (normalize(name)==name) are indexed first so a normalized form that is itself
+// a raw key resolves to that exact key's rates; non-canonical spellings then
+// fill only the remaining gaps. Collisions only ever join equal-rate keys, so
+// first-seen-wins preserves the (Rates, bool) result of the old ordered scan.
+func (t *Table) indexNorm() {
+	t.norm = make(map[string]Rates, len(t.rates))
+	for name, r := range t.rates {
+		if normalize(name) == name {
+			t.norm[name] = r
+		}
+	}
+	for name, r := range t.rates {
+		n := normalize(name)
+		if n != name {
+			if _, ok := t.norm[n]; !ok {
+				t.norm[n] = r
+			}
+		}
+	}
 }
 
 // Get returns the active table.
@@ -145,14 +178,21 @@ func (t *Table) Find(model string) (Rates, bool) {
 	if base, ok := strings.CutSuffix(model, "-fast"); ok {
 		model, fast = base, true
 	}
+
+	// Common path — one normalize() plus one map probe, no candidateKeys
+	// allocation. indexNorm indexes every key in rates by its normalized form,
+	// so any raw or lowercased hit is covered here; the t.rates probes that
+	// followed in the old ordered scan are unreachable (if model were in rates,
+	// its normalized form is already in norm) and are omitted.
+	norm := normalize(model)
+	if r, ok := t.norm[norm]; ok {
+		return withFast(r, fast), true
+	}
+	// Rare spelling variants: stripped date suffix, prefix walks, dotted
+	// provider segments. candidateKeys allocates; only reached on miss above.
 	for _, key := range candidateKeys(model) {
 		if r, ok := t.rates[key]; ok {
-			// Fast speed is a request attribute: apply 1.0 only when neither the
-			// table entry nor a "-fast"-suffixed sibling defined a multiplier.
-			if fast && r.FastMultiplier == 0 {
-				r.FastMultiplier = 1.0
-			}
-			return r, true
+			return withFast(r, fast), true
 		}
 	}
 	// A "-fast" query whose stripped form is unknown may still match a table
@@ -165,6 +205,15 @@ func (t *Table) Find(model string) (Rates, bool) {
 		}
 	}
 	return Rates{}, false
+}
+
+// withFast applies the default 1.0 fast multiplier when the request is fast and
+// neither the table entry nor a "-fast"-suffixed sibling defined one.
+func withFast(r Rates, fast bool) Rates {
+	if fast && r.FastMultiplier == 0 {
+		r.FastMultiplier = 1.0
+	}
+	return r
 }
 
 // Known reports whether any rates resolve for the model.
@@ -237,6 +286,21 @@ func candidateKeys(model string) []string {
 }
 
 func normalize(model string) string {
+	// Fast path: if the name is already lowercase ASCII with no '.' or '@',
+	// it needs no transformation — return as-is to skip the ToLower and
+	// ReplaceAll allocations on the lookup hot path. Non-ASCII bytes (>127)
+	// fall through so Unicode case folding stays correct.
+	needs := false
+	for i := 0; i < len(model); i++ {
+		c := model[i]
+		if c >= 'A' && c <= 'Z' || c == '.' || c == '@' || c > 127 {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return model
+	}
 	s := strings.ToLower(model)
 	s = strings.ReplaceAll(s, ".", "-")
 	s = strings.ReplaceAll(s, "@", "-")

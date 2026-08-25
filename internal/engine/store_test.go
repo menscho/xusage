@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -130,8 +131,6 @@ func writeStubFile(t *testing.T, name string, modTime time.Time, lines ...string
 func stubLine(id string, at time.Time, in, out uint64) string {
 	return fmt.Sprintf("%d %s %d %d", at.Unix(), id, in, out)
 }
-
-var _ = model.Entry{} // keep model import anchored if fixtures change
 
 func TestLoadParsesAllFilesAndSetsProvider(t *testing.T) {
 	registerStubSource(t)
@@ -411,6 +410,53 @@ func TestConcurrentGetSafety(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// entryKey identifies one canonical survivor independent of position, so the
+// confluence check below can compare result sets regardless of ordering.
+func entryKey(e model.Entry) string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%dt\x00%v",
+		e.Provider, e.ID, e.RequestID, e.TotalTokens(), e.IsSidechain)
+}
+
+// TestParseTimeDedupIsConfluent locks in the invariant that makes per-file
+// dedup safe: folding within each file then across files must yield exactly the
+// same survivors as folding the whole set at once. If this ever breaks, the
+// per-file dedup in parsePending would silently drop or keep entries.
+func TestParseTimeDedupIsConfluent(t *testing.T) {
+	// Two logical files. File 1 carries a main-chain copy plus two sidechain
+	// replays of the same message ID (the common Claude shape); file 2 carries
+	// a better main-chain copy (more tokens) for that same ID plus an unrelated
+	// entry. A single global pass keeps the file-2 main copy and the unrelated
+	// entry, dropping both sidechains and the weaker file-1 main copy.
+	file1 := []model.Entry{
+		{Provider: "claude", ID: "msg_1", RequestID: "req_1", InputTokens: 10, OutputTokens: 1},
+		{Provider: "claude", ID: "msg_1", RequestID: "req_A", InputTokens: 1, OutputTokens: 0, IsSidechain: true},
+		{Provider: "claude", ID: "msg_1", RequestID: "req_B", InputTokens: 2, OutputTokens: 0, IsSidechain: true},
+	}
+	file2 := []model.Entry{
+		{Provider: "claude", ID: "msg_1", RequestID: "req_1", InputTokens: 50, OutputTokens: 5},
+		{Provider: "claude", ID: "msg_2", RequestID: "req_2", InputTokens: 7, OutputTokens: 0},
+	}
+
+	global := dedupe(append(append([]model.Entry{}, file1...), file2...))
+	perFile := dedupe(append(dedupe(file1), dedupe(file2)...))
+
+	keySet := func(es []model.Entry) map[string]int {
+		m := map[string]int{}
+		for _, e := range es {
+			m[entryKey(e)]++
+		}
+		return m
+	}
+	gk, pk := keySet(global), keySet(perFile)
+	if !reflect.DeepEqual(gk, pk) {
+		t.Fatalf("per-file dedup changed survivors:\n  global: %v\n  per-file: %v", gk, pk)
+	}
+	// And the concrete expected survivors: the stronger main copy + msg_2.
+	if len(global) != 2 {
+		t.Fatalf("global survivors = %d, want 2", len(global))
+	}
 }
 
 func TestSnapshotDoesNotAliasPreviousEntries(t *testing.T) {

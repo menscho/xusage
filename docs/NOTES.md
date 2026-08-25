@@ -1805,3 +1805,27 @@
   green chart bars. Verified: go build/vet/test -count=1 ./... green (23 pkgs),
   node --check x12 js, harness 188/0/0, live E2E (GSAP shell serves, no sidebar,
   gzip 76%, daily/pulse/1d-today APIs work).
+
+- [batch3-zed-trae-augment] Added three lower-confidence source adapters and wired
+  them into internal/sources/all/all.go (alphabetical blank-imports: augment, trae,
+  zed; cline/cursor were already added by the parallel CLI batch). All three
+  follow the sourcesutil + jsonx adapter precedent (env-var override wins over a
+  home-relative default, only existing dirs count, best-effort lenient parsers,
+  t.TempDir() table tests, no network). Verified: go build/vet/test green for
+  zed/trae/augment + all; node --check green x13 js. DOCUMENTED ASSUMPTIONS:
+  (1) ZED — native store is ~/.local/share/zed/threads/threads.db (SQLite);
+  stdlib-only Go cannot link a SQLite driver, so the adapter parses JSONL/JSON
+  thread exports dropped in the same tree (same limitation + workaround as the
+  kilo.db adapter). (2) TRAE — schema is undocumented; adapter best-effort-reads
+  a usage cache under $TRAE_DATA_DIR or ~/.cache/trae (XDG cache), accepting
+  flat records, a {records/items/data} envelope, or JSONL; records need a model
+  + token block. (3) AUGMENT — one session JSON per file under
+  ~/.augment/sessions (file stem = session id); token block under usage/tokens
+  or flat. NOTES: roocode (other agent) was initially broken with the same
+  `existingDirs` variadic-call mistake but now builds; devin (other agent) builds
+  but its TEST fails (unused var `e5` in devin_test.go:109) — both are NOT mine
+  and absent from all.go, so left untouched per SPEC §0 (foreign packages). Once
+  devin's test is green, add devin + roocode blank-imports to all.go and extend the
+  `want` list in all_test.go. Cache-hit-rate helper already exists on XU.fmt
+  (app.js fmt.cacheHitRate); frontend needs NO source-list edits — new sources
+  auto-surface via the dynamic /api/meta + /api/providers endpoints.

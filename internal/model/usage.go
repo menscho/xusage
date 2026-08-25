@@ -179,6 +179,10 @@ type Block struct {
 	Projection          *Projection `json:"projection,omitempty"`
 	UsageLimitReset     *time.Time  `json:"usageLimitReset,omitempty"`
 
-	// Entries backs the block during construction; never serialized.
+	// Entries holds this block's entries as an owned value copy (never a
+	// snapshot alias). It is read by the engine's fillBlock for token/cost
+	// aggregation and by blockBurnRate for the first/last timestamps, so it is
+	// NOT vestigial even though the API never serializes it (json:"-"). Removing
+	// it requires reworking internal/engine/blocks.go and breaks its tests.
 	Entries []Entry `json:"-"`
 }

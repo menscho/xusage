@@ -1,751 +1,848 @@
-// xusage app core: XU global (fetch/state/format/instant-load), hash router,
-// topbar wiring, clock, and the /api/pulse poller (SPEC §9.1 + §13).
-//
-// The shell (index.html) is static chrome — this file never rebuilds the nav;
-// it fills the mount points (brand tag, clock, provider chip, updated stamp)
-// and toggles .active on .nav a[data-view]. Views register themselves via
-// XU.registerView(name, {mount, unmount}).
-//
-// §13 additions over the frozen §9.1 surface: fmt.big, XU.pill, XU.pulse /
-// XU.onPulse, a vendor key in XU.state (emitted by XU.q), the GSAP instant-
-// load layer (XU.cacheGet/cacheSet/swr/prefetch), the #clock ticker, and the
-// controls-strip binding (range/mode/tz segs, provider chip, export, rescan).
-
+/* xusage / ledger — wired to the real xusage HTTP API.
+   Same layout, charts and router as the static prototype; mock data replaced
+   with fetch() calls against /api/daily, /api/models, /api/summary,
+   /api/pulse, /api/blocks, /api/meta. */
 (function () {
   'use strict';
 
-  // ---- state ---------------------------------------------------------------
-
-  var DEFAULT_STATE = {
-    range: '30d',   // 1d | 3d | 7d | 30d | 90d | all
-    since: '',      // YYYY-MM-DD, used when range == 'custom'
-    until: '',
-    tz: 'local',    // local | utc
-    mode: 'auto',   // auto | display | calculate
-    project: '',
-    session: '',
-    model: '',
-    provider: '',
-    vendor: ''
+  var C = {
+    input:   '#6e9fff',
+    output:  '#3ecf8e',
+    cread:   '#f5c86b',
+    ccreate: '#c69df5',
+    accent:  '#ff5c38',
+    hairline:'#1d2029',
+    faint:   '#525763',
+    cat: ['#ff5c38', '#6e9fff', '#3ecf8e', '#c69df5', '#f5c86b', '#4cc2c2', '#f27e98', '#9aa7ff', '#d9a05b']
   };
 
-  function loadState() {
-    try {
-      var raw = localStorage.getItem('xu.state');
-      if (raw) { return JSON.parse(raw); }
-    } catch (e) { /* private mode etc. */ }
-    return {};
+  var state = { range: '7d', metric: 'tokens', route: 'overview' };
+  var RANGE_DAYS = { '1d': 1, '7d': 7, '30d': 30, '90d': 90, 'all': 9999 };
+
+  var DAYS = [];
+  var MODELS = [];
+  var SUMMARY = {};
+  var PULSE = {};
+  var BLOCKS = [];
+
+  function api(path) {
+    return fetch(path).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
   }
 
-  var state = Object.assign({}, DEFAULT_STATE, loadState());
-
-  var stateListeners = [];
-  var listenerGen = 0;
-
-  function setState(patch) {
-    Object.assign(state, patch);
-    try { localStorage.setItem('xu.state', JSON.stringify(state)); } catch (e) {}
-    renderProviderChip();
-    syncControls();
-    for (var i = 0; i < stateListeners.length; ) {
-      var sub = stateListeners[i];
-      if (sub.gen < listenerGen) {
-        stateListeners.splice(i, 1);
-        continue;
-      }
-      i++;
-      try { sub.fn(); } catch (e) { /* a broken view must not stop the rest */ }
-    }
-    if (patch.provider !== undefined) { updateProvChip(); }
+  function vendorFromKey(key) {
+    var k = String(key).toLowerCase();
+    if (k.indexOf('claude') >= 0) return 'Anthropic';
+    if (k.indexOf('gpt') >= 0 || k.indexOf('o1') >= 0 || k.indexOf('o3') >= 0) return 'OpenAI';
+    if (k.indexOf('kimi') >= 0 || k.indexOf('moonshot') >= 0) return 'Moonshot';
+    if (k.indexOf('gemini') >= 0) return 'Google';
+    if (k.indexOf('qwen') >= 0) return 'Qwen';
+    if (k.indexOf('deepseek') >= 0) return 'DeepSeek';
+    if (k.indexOf('grok') >= 0) return 'xAI';
+    if (k.indexOf('opencode') >= 0) return 'OpenCode';
+    if (k.indexOf('codex') >= 0) return 'OpenAI';
+    if (k.indexOf('longcat') >= 0) return 'LongCat';
+    var parts = String(key).split('/');
+    return parts.length > 1 ? parts[0] : 'Other';
   }
 
-  function onState(fn) {
-    var sub = { fn: fn, gen: listenerGen };
-    stateListeners.push(sub);
-    return function () {
-      var i = stateListeners.indexOf(sub);
-      if (i >= 0) { stateListeners.splice(i, 1); }
-    };
+  function familyFromKey(key) {
+    var k = String(key).toLowerCase();
+    if (k.indexOf('claude') >= 0) return 'claude';
+    if (k.indexOf('gpt') >= 0 || k.indexOf('o1') >= 0 || k.indexOf('o3') >= 0 || k.indexOf('codex') >= 0) return 'gpt';
+    if (k.indexOf('kimi') >= 0) return 'kimi';
+    if (k.indexOf('gemini') >= 0) return 'gemini';
+    if (k.indexOf('qwen') >= 0) return 'qwen';
+    if (k.indexOf('deepseek') >= 0) return 'deepseek';
+    if (k.indexOf('grok') >= 0) return 'grok';
+    return 'other';
   }
 
-  // ---- query helper ---------------------------------------------------------
+  function dayCost(d) { return Number(d.cost) || 0; }
 
-  function q(extra) {
-    var eff = Object.assign({}, state, extra || {});
-    var params = [];
-    var since = eff.since, until = eff.until;
-    if (!since && !until && eff.range !== 'all') {
-      var r = rangeBounds(eff.range);
-      if (r) { since = r.since; until = r.until; }
-    }
-    if (since) { params.push('since=' + encodeURIComponent(since)); }
-    if (until) { params.push('until=' + encodeURIComponent(until)); }
-    if (eff.tz === 'utc') { params.push('tz=UTC'); }
-    if (eff.mode && eff.mode !== 'auto') { params.push('mode=' + encodeURIComponent(eff.mode)); }
-    ['project', 'session', 'model', 'provider', 'vendor'].forEach(function (k) {
-      if (eff[k]) { params.push(k + '=' + encodeURIComponent(eff[k])); }
+  function dayTotal(d) {
+    var t = 0;
+    (d.models || []).forEach(function (m) {
+      t += (m.inputTokens || 0) + (m.outputTokens || 0) + (m.cacheReadTokens || 0) + (m.cacheCreationTokens || 0);
     });
-    return params.length ? '?' + params.join('&') : '';
+    return t + (d.extraTotalTokens || 0);
   }
 
-  // rangeBounds maps a named range to concrete since/until dates (local time).
-  // GSAP ranges: 1d | 3d | 7d | 30d | 90d | all.
-  function rangeBounds(range) {
-    function pad(x) { return String(x).padStart(2, '0'); }
-    function fmt(d) {
-      return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
-    }
-    var now = new Date();
-    switch (range) {
-      case '1d': { var t = new Date(now); return { since: fmt(t), until: fmt(t) }; }
-      case '3d': { var a = new Date(now); a.setDate(a.getDate() - 2); return { since: fmt(a), until: '' }; }
-      case '7d': { var b = new Date(now); b.setDate(b.getDate() - 6); return { since: fmt(b), until: '' }; }
-      case '30d': { var c = new Date(now); c.setDate(c.getDate() - 29); return { since: fmt(c), until: '' }; }
-      case '90d': { var d = new Date(now); d.setDate(d.getDate() - 89); return { since: fmt(d), until: '' }; }
-      case 'ytd': return { since: now.getFullYear() + '-01-01', until: '' };
-      default: return null; // all / custom-without-dates
-    }
-  }
-
-  // ---- instant-load layer (SPEC §13.0.1) -------------------------------------
-  // Stale-while-revalidate localStorage cache. cacheKey = viewName + ':' + q().
-
-  var CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
-  var CACHE_MAX_BYTES = 1024 * 1000; // 1 MB cap
-  var CACHE_PREFIX = 'xu.swr:';
-
-  function cacheGet(key) {
-    try {
-      var raw = localStorage.getItem(CACHE_PREFIX + key);
-      if (!raw) { return null; }
-      var entry = JSON.parse(raw);
-      if (!entry || !entry.t || typeof entry.t !== 'number') { return null; }
-      if (Date.now() - entry.t > CACHE_TTL_MS) { return null; }
-      return entry.d;
-    } catch (e) { return null; }
-  }
-
-  function cacheSet(key, data) {
-    try {
-      var payload = JSON.stringify({ t: Date.now(), d: data });
-      if (payload.length > CACHE_MAX_BYTES) { return false; } // too big: skip
-      localStorage.setItem(CACHE_PREFIX + key, payload);
-      return true;
-    } catch (e) { return false; } // private mode / quota
-  }
-
-  // swr(cacheKey, loadFn, renderFn): paint cached synchronously, then refetch.
-  //   (a) var c = cacheGet(key); if (c) renderFn(c, true)  -> INSTANT paint
-  //   (b) loadFn() resolves -> if no cache or JSON changed, cacheSet + renderFn(fresh, false)
-  function swr(cacheKey, loadFn, renderFn) {
-    var cached = cacheGet(cacheKey);
-    if (cached) {
-      try { renderFn(cached, true); } catch (e) { /* view render is best-effort */ }
-    }
-    var fresh = null;
-    return Promise.resolve()
-      .then(function () { return loadFn(); })
-      .then(function (data) {
-        fresh = data;
-        if (!cached) {
-          cacheSet(cacheKey, data);
-          try { renderFn(data, false); } catch (e) {}
-          return;
-        }
-        // Only repaint when the payload actually changed (avoids flicker).
-        var changed = false;
-        try { changed = JSON.stringify(cached) !== JSON.stringify(data); } catch (e) {}
-        if (changed) {
-          cacheSet(cacheKey, data);
-          try { renderFn(data, false); } catch (e) {}
-        }
-      })
-      .then(function () { return fresh; });
-  }
-
-  // prefetch fires a set of GETs in parallel to warm connections at boot.
-  function prefetch(urls) {
-    if (!Array.isArray(urls)) { return Promise.resolve([]); }
-    return Promise.all(urls.map(function (url) {
-      return fetchJSON(url).catch(function () { return null; });
-    }));
-  }
-
-  // ---- fetch -----------------------------------------------------------------
-
-  function fetchJSON(path) {
-    return fetch(path, { headers: { Accept: 'application/json' } }).then(function (res) {
-      if (!res.ok) {
-        return res.text().then(function (body) {
-          var msg = body;
-          try { msg = JSON.parse(body).error || body; } catch (e) {}
-          throw { status: res.status, message: String(msg || res.statusText) };
-        });
-      }
-      return res.json();
-    }, function (err) {
-      throw { status: 0, message: err && err.message ? err.message : 'network error' };
-    });
-  }
-
-  function postJSON(path) {
-    return fetch(path, { method: 'POST' }).then(function (res) {
-      if (!res.ok) { throw { status: res.status, message: res.statusText }; }
-      return res.json();
-    });
-  }
-
-  // ---- formatting ---------------------------------------------------------------
-
-  var fmt = {};
-
-  fmt.num = function (n) {
-    if (n == null || isNaN(n)) { return '0'; }
-    return Number(n).toLocaleString('en-US');
-  };
-
-  fmt.tokens = function (n) {
+  function fmtBig(n) {
     n = Number(n) || 0;
-    var abs = Math.abs(n);
-    if (abs >= 1e12) { return trim1(n / 1e12) + 'T'; }
-    if (abs >= 1e9) { return trim1(n / 1e9) + 'B'; }
-    if (abs >= 1e6) { return trim1(n / 1e6) + 'M'; }
-    if (abs >= 1e3) { return trim1(n / 1e3) + 'k'; }
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
     return String(Math.round(n));
-  };
-
-  function trim1(x) {
-    var r = Math.round(x * 10) / 10;
-    if (Math.abs(r) >= 100 || r === Math.floor(r)) { return String(Math.round(r)); }
-    return String(r);
   }
-
-  // fmt.big — compact volume figures (SPEC §13.3):
-  // 987 → "987", 1234567 → "1.23M", 1834000000 → "1.83B".
-  fmt.big = function (n) {
+  function fmtCost(n) {
     n = Number(n) || 0;
-    var sign = n < 0 ? '-' : '';
-    var abs = Math.abs(n);
-    if (abs < 1e6) { return sign + String(Math.round(abs)); }
-    var x, suffix;
-    if (abs >= 1e12) { x = abs / 1e12; suffix = 'T'; }
-    else if (abs >= 1e9) { x = abs / 1e9; suffix = 'B'; }
-    else { x = abs / 1e6; suffix = 'M'; }
-    return sign + x.toFixed(2).replace(/\.?0+$/, '') + suffix;
-  };
-
-  fmt.cost = function (n, precise) {
-    n = Number(n) || 0;
-    var abs = Math.abs(n);
-    if (precise || abs < 10) { return '$' + n.toFixed(abs >= 100 ? 0 : 2); }
-    if (abs >= 1000) { return '$' + fmt.tokens(Math.round(n)); }
-    return '$' + n.toFixed(0);
-  };
-
-  fmt.pct = function (n) {
-    n = Number(n) || 0;
-    return (n >= 10 ? Math.round(n) : n.toFixed(1)) + '%';
-  };
-
-  fmt.date = function (iso) {
-    if (!iso || iso.length < 10) { return iso || ''; }
-    var y = iso.slice(0, 4), m = iso.slice(5, 7), d = iso.slice(8, 10);
-    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    return months[Number(m) - 1] + ' ' + d + ', ' + y;
-  };
-
-  fmt.datetime = function (iso) {
-    if (!iso) { return ''; }
+    if (n >= 1000) return '$' + (n / 1000).toFixed(2) + 'K';
+    if (n >= 100) return '$' + n.toFixed(0);
+    return '$' + n.toFixed(2);
+  }
+  function fmtMetric(n) {
+    return state.metric === 'cost' ? fmtCost(n) : state.metric === 'calls' ? fmtBig(n) : fmtBig(n);
+  }
+  function fmtDate(iso) {
+    if (!iso) return '';
     var d = new Date(iso);
-    if (isNaN(d.getTime())) { return String(iso); }
-    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    var pad = function (x) { return String(x).padStart(2, '0'); };
-    return months[d.getMonth()] + ' ' + d.getDate() + ' ' +
-      pad(d.getHours()) + ':' + pad(d.getMinutes());
-  };
-
-  fmt.duration = function (sec) {
-    sec = Number(sec) || 0;
-    if (sec < 60) { return Math.round(sec) + 's'; }
-    var m = Math.floor(sec / 60);
-    var h = Math.floor(m / 60);
-    m = m % 60;
-    if (h === 0) { return m + 'm'; }
-    var d = Math.floor(h / 24);
-    h = h % 24;
-    if (d === 0) { return h + 'h ' + m + 'm'; }
-    return d + 'd ' + h + 'h';
-  };
-
-  // GSAP categorical palette (§13.0): brand green first, then the taxonomy
-  // hues (never reused across categories): orange, pink, lilac, blue.
-  var CATEGORICAL = ['#0ae448', '#abff84', '#ff8709', '#fec5fb', '#9d95ff', '#00bae2',
-                     '#7c7c6f', '#42433d'];
-
-  var colors = {
-    categorical: CATEGORICAL.slice(),
-    series: function (i) { return CATEGORICAL[i % CATEGORICAL.length]; },
-    accent: '#0ae448',
-    muted: '#7c7c6f'
-  };
-
-  // colorFor assigns a stable categorical color per label across views.
-  var colorMap = {};
-  var nextColor = 0;
-  function colorFor(label) {
-    if (!(label in colorMap)) { colorMap[label] = colors.series(nextColor++); }
-    return colorMap[label];
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+  function fmtDateLong(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    return d.toLocaleDateString(undefined, { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' });
+  }
+  function metricOfDay(day) {
+    if (state.metric === 'cost') return dayCost(day);
+    if (state.metric === 'calls') return Number(day.messages) || 0;
+    return dayTotal(day);
   }
 
-  // ---- DOM helpers (shared, not part of the frozen API) ------------------------
-
-  function el(tag, cls, text) {
-    var node = document.createElement(tag);
-    if (cls) { node.className = cls; }
-    if (text != null) { node.textContent = text; }
-    return node;
+  function hitRate(input, cacheRead) {
+    var denom = (Number(input) || 0) + (Number(cacheRead) || 0);
+    return denom > 0 ? (Number(cacheRead) || 0) / denom * 100 : 0;
+  }
+  function fmtPct(n) { return (Number(n) || 0).toFixed(2) + '%'; }
+  function dayHitRate(day) {
+    var inp = 0, cr = 0;
+    (day.models || []).forEach(function (m) { inp += m.inputTokens || 0; cr += m.cacheReadTokens || 0; });
+    return hitRate(inp, cr);
   }
 
+  function el(tag, cls, html) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html != null) e.innerHTML = html;
+    return e;
+  }
   function esc(s) {
-    return String(s == null ? '' : s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
   }
 
-  function skeletonRows(container, rows, cols) {
-    container.innerHTML = '';
-    var wrap = el('div');
-    for (var i = 0; i < rows; i++) {
-      var line = el('div', 'row');
-      line.style.marginBottom = '8px';
-      for (var c = 0; c < cols; c++) {
-        var sk = el('div', 'skeleton');
-        sk.style.height = '14px';
-        sk.style.width = (60 + ((i * 7 + c * 13) % 25)) + '%';
-        sk.style.flex = c === 0 ? '2' : '1';
-        line.appendChild(sk);
-      }
-      wrap.appendChild(line);
+  var tip = el('div', 'chart-tip');
+  document.body.appendChild(tip);
+  function showTip(x, y, html) {
+    tip.innerHTML = html;
+    tip.classList.add('show');
+    var r = tip.getBoundingClientRect();
+    var lx = Math.min(x + 14, window.innerWidth - r.width - 10);
+    var ly = Math.max(10, y - r.height - 12);
+    tip.style.left = lx + 'px';
+    tip.style.top = ly + 'px';
+  }
+  function hideTip() { tip.classList.remove('show'); }
+
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function niceMax(v) {
+    if (v <= 0) return 1;
+    var p = Math.pow(10, Math.floor(Math.log10(v)));
+    var n = v / p;
+    var m = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+    return m * p;
+  }
+
+  function lineChart(container, opts) {
+    if (!container) return;
+    var W = container.clientWidth || 600;
+    var H = opts.height || 220;
+    var pad = { l: 46, r: 10, t: 12, b: 24 };
+    var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+    var svg = svgEl('svg', { 'class': 'chart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H });
+    var max = 0;
+    opts.series.forEach(function (s) { s.values.forEach(function (v) { if (v > max) max = v; }); });
+    max = niceMax(max);
+    for (var g = 0; g <= 4; g++) {
+      var y = pad.t + ih - (ih * g / 4);
+      svg.appendChild(svgEl('line', { 'class': 'grid-ln', x1: pad.l, x2: W - pad.r, y1: y, y2: y }));
+      var t = svgEl('text', { 'class': 'axis-txt', x: pad.l - 8, y: y + 3, 'text-anchor': 'end' });
+      t.textContent = opts.yFormat(max * g / 4);
+      svg.appendChild(t);
     }
+    var n = opts.labels.length;
+    var stepX = n > 1 ? iw / (n - 1) : iw;
+    var every = Math.ceil(n / 8);
+    for (var i = 0; i < n; i += every) {
+      var tx = svgEl('text', { 'class': 'axis-txt', x: pad.l + i * stepX, y: H - 7, 'text-anchor': 'middle' });
+      tx.textContent = opts.labels[i];
+      svg.appendChild(tx);
+    }
+    opts.series.forEach(function (s) {
+      var pts = s.values.map(function (v, ii) { return [pad.l + ii * stepX, pad.t + ih - (v / max) * ih]; });
+      var dAttr = pts.map(function (p, ii) { return (ii ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1); }).join('');
+      if (opts.area) {
+        var area = svgEl('path', { 'class': 'area-fill', d: dAttr + 'L' + (pad.l + (n - 1) * stepX) + ' ' + (pad.t + ih) + 'L' + pad.l + ' ' + (pad.t + ih) + 'Z', fill: s.color });
+        svg.appendChild(area);
+      }
+      /* emphasis halo: wide soft echo under the primary line */
+      svg.appendChild(svgEl('path', { d: dAttr, fill: 'none', stroke: s.color, 'stroke-width': 7, opacity: 0.10, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+      svg.appendChild(svgEl('path', { 'class': 'line-main', d: dAttr, stroke: s.color }));
+      var last = pts[pts.length - 1];
+      svg.appendChild(svgEl('circle', { 'class': 'dot-live', cx: last[0], cy: last[1], r: 3 }));
+    });
+    var hoverLn = svgEl('line', { x1: 0, x2: 0, y1: pad.t, y2: pad.t + ih, stroke: C.faint, 'stroke-dasharray': '3 3', opacity: 0 });
+    svg.appendChild(hoverLn);
+    svg.addEventListener('mousemove', function (ev) {
+      var r = svg.getBoundingClientRect();
+      var mx = (ev.clientX - r.left) * (W / r.width);
+      var idx = Math.round((mx - pad.l) / stepX);
+      if (idx < 0 || idx >= n) { hideTip(); hoverLn.setAttribute('opacity', 0); return; }
+      hoverLn.setAttribute('opacity', 1);
+      hoverLn.setAttribute('x1', pad.l + idx * stepX);
+      hoverLn.setAttribute('x2', pad.l + idx * stepX);
+      var html = '<div class="tt-title">' + esc(opts.tipTitle ? opts.tipTitle(idx) : opts.labels[idx]) + '</div>';
+      opts.series.forEach(function (s) { html += '<div class="tt-row"><span><i style="background:' + s.color + '"></i>' + esc(s.name) + '</span><b>' + opts.yFormat(s.values[idx]) + '</b></div>'; });
+      if (opts.tipExtra) html += opts.tipExtra(idx);
+      showTip(ev.clientX, ev.clientY, html);
+    });
+    svg.addEventListener('mouseleave', function () { hideTip(); hoverLn.setAttribute('opacity', 0); });
+    container.appendChild(svg);
+  }
+
+  function barChart(container, opts) {
+    if (!container) return;
+    var W = container.clientWidth || 600;
+    var H = opts.height || 220;
+    var pad = { l: 46, r: 10, t: 12, b: 24 };
+    var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+    var svg = svgEl('svg', { 'class': 'chart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H });
+    var max = 0;
+    opts.groups.forEach(function (g) { var t = 0; g.parts.forEach(function (p) { t += p.value; }); if (t > max) max = t; });
+    max = niceMax(max);
+    for (var g = 0; g <= 4; g++) {
+      var y = pad.t + ih - (ih * g / 4);
+      svg.appendChild(svgEl('line', { 'class': 'grid-ln', x1: pad.l, x2: W - pad.r, y1: y, y2: y }));
+      var t = svgEl('text', { 'class': 'axis-txt', x: pad.l - 8, y: y + 3, 'text-anchor': 'end' });
+      t.textContent = opts.yFormat(max * g / 4);
+      svg.appendChild(t);
+    }
+    var n = opts.groups.length;
+    var slot = iw / n;
+    var bw = Math.max(3, Math.min(34, slot * 0.62));
+    var every = Math.ceil(n / 10);
+    opts.groups.forEach(function (grp, i) {
+      var x = pad.l + i * slot + (slot - bw) / 2;
+      var acc = 0;
+      grp.parts.forEach(function (p) {
+        var h = (p.value / max) * ih;
+        if (h <= 0) return;
+        svg.appendChild(svgEl('rect', { 'class': 'bar', x: x, y: pad.t + ih - acc - h, width: bw, height: Math.max(0.5, h), fill: p.color }));
+        acc += h;
+      });
+      if (i % every === 0) {
+        var tx = svgEl('text', { 'class': 'axis-txt', x: pad.l + i * slot + slot / 2, y: H - 7, 'text-anchor': 'middle' });
+        tx.textContent = grp.label;
+        svg.appendChild(tx);
+      }
+    });
+    svg.addEventListener('mousemove', function (ev) {
+      var r = svg.getBoundingClientRect();
+      var mx = (ev.clientX - r.left) * (W / r.width);
+      var idx = Math.floor((mx - pad.l) / slot);
+      if (idx < 0 || idx >= n) { hideTip(); return; }
+      var grp = opts.groups[idx];
+      var html = '<div class="tt-title">' + esc(grp.tipTitle || grp.label) + '</div>';
+      grp.parts.forEach(function (p) { if (p.value <= 0) return; html += '<div class="tt-row"><span><i style="background:' + p.color + '"></i>' + esc(p.name) + '</span><b>' + opts.yFormat(p.value) + '</b></div>'; });
+      if (opts.tipExtra) html += opts.tipExtra(idx);
+      showTip(ev.clientX, ev.clientY, html);
+    });
+    svg.addEventListener('mouseleave', hideTip);
+    container.appendChild(svg);
+  }
+
+  function donut(container, opts) {
+    if (!container) return;
+    var size = opts.size || 150;
+    var r = size / 2, ir = r * 0.68;
+    var svg = svgEl('svg', { width: size, height: size, viewBox: '0 0 ' + size + ' ' + size });
+    var total = 0;
+    opts.slices.forEach(function (s) { total += s.value; });
+    var a0 = -Math.PI / 2;
+    opts.slices.forEach(function (s) {
+      var frac = total ? s.value / total : 0;
+      var a1 = a0 + frac * Math.PI * 2;
+      if (frac > 0.001) {
+        var large = frac > 0.5 ? 1 : 0;
+        var p = svgEl('path', {
+          d: 'M' + r + ' ' + r + 'L' + (r + r * Math.cos(a0)) + ' ' + (r + r * Math.sin(a0)) +
+             'A' + r + ' ' + r + ' 0 ' + large + ' 1 ' + (r + r * Math.cos(a1)) + ' ' + (r + r * Math.sin(a1)) + 'Z',
+          fill: s.color, opacity: 0.92
+        });
+        p.addEventListener('mousemove', function (ev) {
+          showTip(ev.clientX, ev.clientY,
+            '<div class="tt-row"><span><i style="background:' + s.color + '"></i>' + esc(s.name) +
+            '</span><b>' + opts.yFormat(s.value) + ' · ' + Math.round(frac * 100) + '%</b></div>' +
+            (s.hitRate != null ? '<div class="tt-row"><span><i style="background:' + C.cread + '"></i>cache hit</span><b>' + fmtPct(s.hitRate) + '</b></div>' : ''));
+        });
+        p.addEventListener('mouseleave', hideTip);
+        svg.appendChild(p);
+      }
+      a0 = a1;
+    });
+    svg.appendChild(svgEl('circle', { cx: r, cy: r, r: ir, fill: '#101218' }));
+    var wrap = el('div', 'donut-wrap');
+    var left = el('div');
+    left.style.position = 'relative';
+    left.appendChild(svg);
+    var center = el('div', null,
+      '<div class="donut-center-val">' + opts.center.value + '</div>' +
+      '<div class="donut-center-key">' + esc(opts.center.label) + '</div>');
+    center.style.cssText = 'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;pointer-events:none;';
+    left.appendChild(center);
+    wrap.appendChild(left);
+    var legend = el('div', 'donut-legend');
+    opts.slices.slice(0, 6).forEach(function (s) {
+      legend.appendChild(el('div', 'donut-row',
+        '<i style="background:' + s.color + '"></i>' +
+        '<span class="dr-name">' + esc(s.name) + '</span>' +
+        '<span class="dr-val">' + opts.yFormat(s.value) + '</span>'));
+    });
+    wrap.appendChild(legend);
     container.appendChild(wrap);
   }
 
-  function csvEscape(v) {
-    var s = String(v == null ? '' : v);
-    if (/[",\n]/.test(s)) { s = '"' + s.replace(/"/g, '""') + '"'; }
-    return s;
+  function sparkline(container, values, color) {
+    if (!container) return;
+    var W = 84, H = 26;
+    var svg = svgEl('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H });
+    var max = Math.max.apply(null, values) || 1;
+    var pts = values.map(function (v, i) { return [(i / (values.length - 1)) * (W - 4) + 2, H - 3 - (v / max) * (H - 6)]; });
+    var d = pts.map(function (p, i) { return (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1); }).join('');
+    svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: color, 'stroke-width': 1.4, opacity: 0.9 }));
+    container.appendChild(svg);
   }
 
-  function downloadCSV(filename, header, rows) {
-    var lines = [header.map(csvEscape).join(',')];
-    rows.forEach(function (r) { lines.push(r.map(csvEscape).join(',')); });
-    var blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 500);
+  function secLabel(text, note) {
+    return '<div class="sec-label">' + esc(text) + (note ? '<span class="sec-note">' + esc(note) + '</span>' : '') + '</div>';
+  }
+  function modelColor(i) { return C.cat[i % C.cat.length]; }
+  function legendItem(name, color) { return '<span class="legend-item"><i style="background:' + color + '"></i>' + esc(name) + '</span>'; }
+
+  function buildModels(dailyRows, modelRows) {
+    var seen = {};
+    var list = [];
+    (modelRows || []).forEach(function (m) {
+      var key = m.key || m.model;
+      if (seen[key]) return;
+      seen[key] = true;
+      list.push({ key: key, vendor: m.vendor || vendorFromKey(key), family: familyFromKey(key) });
+    });
+    (dailyRows || []).forEach(function (d) {
+      (d.models || []).forEach(function (md) {
+        var key = md.model || md.key;
+        if (!key || seen[key]) return;
+        seen[key] = true;
+        list.push({ key: key, vendor: vendorFromKey(key), family: familyFromKey(key) });
+      });
+    });
+    return list;
   }
 
-  // ---- pill attribution (§13.4) -------------------------------------------------
-
-  function pill(cli, model) {
-    var out = '';
-    if (cli) {
-      out += '<span class="pill pill-cli" title="' + esc(cli) + '">' +
-        '<i>' + esc(String(cli).charAt(0)) + '</i>' + esc(cli) + '</span>';
-    }
-    if (model) {
-      out += '<span class="pill pill-model" title="' + esc(model) + '">' +
-        esc(model) + '</span>';
-    }
+  function modelTotals(days) {
+    var out = {};
+    MODELS.forEach(function (m) { out[m.key] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, cost: 0, messages: 0 }; });
+    days.forEach(function (day) {
+      (day.models || []).forEach(function (md) {
+        var key = md.model || md.key;
+        var o = out[key];
+        if (!o) return;
+        o.input += md.inputTokens || 0; o.output += md.outputTokens || 0;
+        o.cacheRead += md.cacheReadTokens || 0; o.cacheCreate += md.cacheCreationTokens || 0;
+        var tot = dayTotal(day);
+        if (tot > 0) {
+          var mt = (md.inputTokens || 0) + (md.outputTokens || 0) + (md.cacheReadTokens || 0) + (md.cacheCreationTokens || 0);
+          o.cost += (Number(day.cost) || 0) * (mt / tot);
+        }
+        o.messages += Math.round(((md.inputTokens || 0) + (md.outputTokens || 0) + (md.cacheReadTokens || 0) + (md.cacheCreationTokens || 0)) / 42000);
+      });
+    });
+    MODELS.forEach(function (m) { var o = out[m.key]; o.hitRate = hitRate(o.input, o.cacheRead); });
     return out;
   }
 
-  // ---- toast plumbing -----------------------------------------------------------
-
-  var toastTimer = null;
-  function toast(msg) {
-    var t = document.getElementById('toast');
-    if (!t) { return; }
-    t.textContent = msg;
-    t.classList.add('show');
-    if (toastTimer) { clearTimeout(toastTimer); }
-    toastTimer = setTimeout(function () { t.classList.remove('show'); }, 2600);
+  function grandTotals(days) {
+    var t = { tokens: 0, cost: 0, sessions: 0, messages: 0 };
+    days.forEach(function (d) { t.tokens += dayTotal(d); t.cost += dayCost(d); t.sessions += Number(d.sessions) || 0; t.messages += Number(d.messages) || 0; });
+    return t;
   }
 
-  // ---- router & views -------------------------------------------------------------
+  function splitIO(days) {
+    var s = { input: 0, output: 0 };
+    days.forEach(function (d) { (d.models || []).forEach(function (m) { s.input += m.inputTokens || 0; s.output += m.outputTokens || 0; }); });
+    return s;
+  }
 
-  var VIEW_LABELS = {
-    overview: 'Overview', leaderboard: 'Leaderboard', models: 'Models',
-    clis: 'CLIs', providers: 'Providers', projects: 'Projects',
-    sessions: 'Sessions', series: 'Series', blocks: 'Blocks', live: 'Live', share: 'Share'
-  };
-
-  var VIEWS = ['overview', 'leaderboard', 'models', 'clis', 'providers',
-               'projects', 'sessions', 'series', 'blocks', 'live', 'share'];
+  function rangedDays() {
+    var n = RANGE_DAYS[state.range] || 9999;
+    return DAYS.slice(-n);
+  }
 
   var views = {};
-  var mounted = null;
-  var currentView = 'overview';
 
-  function registerView(name, def) { views[name] = def; }
+  views.overview = function (root) {
+    var days = rangedDays();
+    if (!days.length) { root.innerHTML = '<div class="empty">No data for this range.</div>'; return; }
+    var tot = grandTotals(days);
+    var perDay = days.map(metricOfDay);
+    var labels = days.map(function (d) { return fmtDate(d.date || d.key); });
+    var io = splitIO(days);
+    var totHR = hitRate(io.input, days.reduce(function (s, d) { var cr = 0; (d.models || []).forEach(function (m) { cr += m.cacheReadTokens || 0; }); return s + cr; }, 0));
 
-  function parseHash() {
-    var h = location.hash.replace(/^#\/?/, '');
-    var parts = h.split('?');
-    return parts[0].split('/')[0] || 'overview';
-  }
+    var todayD = days[days.length - 1];
+    var yestD = days[days.length - 2] || todayD;
+    var delta = metricOfDay(yestD) ? (metricOfDay(todayD) - metricOfDay(yestD)) / metricOfDay(yestD) * 100 : 0;
+    var mt = modelTotals(days);
+    var ranked = MODELS.map(function (m, i) {
+      var o = mt[m.key] || { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, cost: 0 };
+      return { m: m, i: i, total: o.input + o.output + o.cacheRead + o.cacheCreate, cost: o.cost, o: o };
+    }).sort(function (a, b) { return b.total - a.total; });
 
-  function route() {
-    listenerGen++;
-    var name = parseHash();
-    var view = views[name];
-    var content = document.getElementById('view');
+    var html = secLabel('overview', state.range + ' window') +
+      '<div class="grid g-kpi">' +
+        kpiCard('total ' + state.metric, fmtMetric(state.metric === 'cost' ? tot.cost : state.metric === 'calls' ? tot.messages : tot.tokens),
+          '<span class="' + (delta >= 0 ? 'up' : 'down') + '">' + (delta >= 0 ? '▲' : '▼') + ' ' + Math.abs(delta).toFixed(1) + '%</span> vs yesterday', perDay, C.accent) +
+        kpiCard('tokens', fmtBig(tot.tokens), fmtBig(io.input) + ' in · ' + fmtBig(io.output) + ' out', null, null) +
+        kpiCard('cache hit rate', fmtPct(totHR), 'cache read / total input', days.map(dayHitRate), C.cread) +
+        kpiCard('sessions', fmtBig(tot.sessions), fmtBig(tot.messages) + ' messages', null, null) +
+        kpiCard('active models', String(ranked.filter(function (r) { return r.total > 0; }).length),
+          ranked[0] ? esc(ranked[0].m.key) + ' leads' : '—', null, null) +
+      '</div>' +
+      secLabel('activity') +
+      '<div class="card"><div class="card-title">' + esc(state.metric) + ' / day <span class="card-note">hover for detail</span></div>' +
+      '<div id="ov-chart"></div></div>' +
+      '<div style="height:12px"></div>' +
+      '<div class="grid g-main">' +
+        '<div class="card"><div class="card-title">model ranking <span class="card-note">by tokens · hit rate</span></div><div id="ov-rank"></div></div>' +
+        '<div class="card"><div class="card-title">share <span class="card-note">' + state.range + ' · hover for hit rate</span></div><div id="ov-donut"></div></div>' +
+      '</div>';
 
-    if (mounted && mounted.unmount) {
-      try { mounted.unmount(); } catch (e) { /* teardown is best-effort */ }
-    }
-    mounted = null;
+    root.innerHTML = html;
 
-    markActive(name);
-    currentView = name;
-    if (!content) { return; }
-
-    if (!view) {
-      content.innerHTML = '';
-      content.appendChild(el('div', 'empty',
-        'Unknown view "' + name + '". Use the top bar navigation.'));
-      document.title = 'xusage';
-      return;
-    }
-
-    document.title = 'xusage — ' + (VIEW_LABELS[name] || name);
-    content.innerHTML = '';
-    // entrance animation
-    content.classList.remove('anim');
-    void content.offsetWidth;
-    content.classList.add('anim');
-    view.mount(content);
-    mounted = view;
-  }
-
-  function markActive(name) {
-    var links = document.querySelectorAll('.nav a');
-    for (var i = 0; i < links.length; i++) {
-      links[i].classList.toggle('active',
-        links[i].getAttribute('data-view') === name);
-    }
-  }
-
-  // show(view) — nav entry point used by nav clicks + XU.show(name).
-  function show(name) {
-    if (location.hash === '#/' + name) {
-      route(); // already there: force remount
-    } else {
-      location.hash = '#/' + name;
-    }
-  }
-
-  // ---- nav click wiring ----------------------------------------------------------
-
-  function initNav() {
-    var nav = document.getElementById('nav');
-    if (!nav) { return; }
-    nav.addEventListener('click', function (ev) {
-      var a = ev.target && ev.target.closest ? ev.target.closest('a[data-view]') : null;
-      if (!a) { return; }
-      ev.preventDefault();
-      var v = a.getAttribute('data-view');
-      show(v);
-    });
-  }
-
-  // ---- controls strip (§13.2) ---------------------------------------------------
-
-  function initControls() {
-    var rangeGroup = document.getElementById('seg-range');
-    var modeGroup = document.getElementById('seg-mode');
-    var tzGroup = document.getElementById('seg-tz');
-
-    if (rangeGroup) {
-      rangeGroup.addEventListener('click', function (ev) {
-        var btn = ev.target && ev.target.closest
-          ? ev.target.closest('button[data-range]') : null;
-        if (!btn) { return; }
-        var r = btn.getAttribute('data-range');
-        setState({ range: r, since: '', until: '' });
-      });
-    }
-    if (modeGroup) {
-      modeGroup.addEventListener('click', function (ev) {
-        var btn = ev.target && ev.target.closest
-          ? ev.target.closest('button[data-mode]') : null;
-        if (!btn) { return; }
-        setState({ mode: btn.getAttribute('data-mode') });
-      });
-    }
-    if (tzGroup) {
-      tzGroup.addEventListener('click', function (ev) {
-        var btn = ev.target && ev.target.closest
-          ? ev.target.closest('button[data-tz]') : null;
-        if (!btn) { return; }
-        setState({ tz: btn.getAttribute('data-tz') });
-      });
-    }
-
-    var provChip = document.getElementById('prov-chip');
-    if (provChip) {
-      provChip.querySelector('.prov-chip-x').addEventListener('click', function () {
-        setState({ provider: '' });
-      });
-    }
-
-    var exportBtn = document.getElementById('export');
-    if (exportBtn) {
-      exportBtn.addEventListener('click', function () {
-        // Views name their export hook exportCsv / exportCSV / export — try each.
-        var fn = mounted && (mounted.exportCsv || mounted.exportCSV || mounted.export);
-        if (typeof fn === 'function') {
-          try { fn.call(mounted); } catch (e) { toast('export failed'); }
-        } else {
-          toast('this view has no export');
-        }
-      });
-    }
-
-    var rescan = document.getElementById('rescan');
-    if (rescan) {
-      rescan.addEventListener('click', function () {
-        rescan.disabled = true;
-        postJSON('/api/refresh').then(function (meta) {
-          renderFoot(meta);
-        }).catch(function () {}).then(function () {
-          rescan.disabled = false;
-          pulse();
-          route();
-        });
-      });
-    }
-
-    updateProvChip();
-  }
-
-  function updateProvChip() {
-    var chip = document.getElementById('prov-chip');
-    if (!chip) { return; }
-    var val = state.provider;
-    if (!val) { chip.hidden = true; return; }
-    chip.hidden = false;
-    chip.querySelector('i').textContent = String(val).charAt(0);
-    chip.querySelector('.prov-chip-val').textContent = val;
-  }
-
-  // syncControls reflects XU.state onto the static controls.
-  function syncControls() {
-    var groups = [
-      { id: 'seg-range', attr: 'data-range', key: 'range' },
-      { id: 'seg-mode', attr: 'data-mode', key: 'mode' },
-      { id: 'seg-tz', attr: 'data-tz', key: 'tz' }
-    ];
-    groups.forEach(function (g) {
-      var box = document.getElementById(g.id);
-      if (!box) { return; }
-      var btns = box.querySelectorAll('button[' + g.attr + ']');
-      for (var i = 0; i < btns.length; i++) {
-        btns[i].classList.toggle('active', btns[i].getAttribute(g.attr) === state[g.key]);
+    lineChart(root.querySelector('#ov-chart'), {
+      series: [{ name: state.metric, color: C.accent, values: perDay }],
+      labels: labels, height: 230, area: true, yFormat: fmtMetric,
+      tipTitle: function (i) { return fmtDateLong(days[i].date || days[i].key); },
+      tipExtra: function (i) {
+        return '<div class="tt-row"><span><i style="background:' + C.cread + '"></i>cache hit</span><b>' + fmtPct(dayHitRate(days[i])) + '</b></div>';
       }
     });
-  }
 
-  function renderProviderChip() { /* no-op: provider chip is in controls */ }
-
-  function renderFoot(meta) {
-    var tag = document.getElementById('brand-tag');
-    if (tag) { tag.textContent = 'v' + ((meta && meta.version) || 'dev'); }
-    var detected = ((meta && meta.providers) || []).filter(function (p) { return p.detected; });
-    var sources = document.getElementById('foot-sources');
-    if (sources) {
-      sources.textContent = detected.length
-        ? detected.length + ' source' + (detected.length > 1 ? 's' : '')
-        : 'no sources';
-    }
-  }
-
-  // ---- clock --------------------------------------------------------------------
-
-  var clockTimer = null;
-  function pad2(n) { return String(n).padStart(2, '0'); }
-
-  function startClock() {
-    function tick() {
-      var now = new Date();
-      var txt = pad2(now.getHours()) + ':' + pad2(now.getMinutes()) + ':' + pad2(now.getSeconds());
-      var clock = document.getElementById('clock');
-      if (clock) { clock.textContent = txt; }
-      var foot = document.getElementById('foot-clock');
-      if (foot) { foot.textContent = txt; }
-    }
-    tick();
-    if (clockTimer) { clearInterval(clockTimer); }
-    clockTimer = setInterval(tick, 1000);
-
-    // Local timezone label (IANA).
-    var tzl = document.getElementById('tzl');
-    if (tzl) {
-      try { tzl.textContent = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local'; }
-      catch (e) { tzl.textContent = 'local'; }
-    }
-  }
-
-  // ---- pulse: /api/pulse poller + fan-out (§13.1/§13.2) ------------------------------
-
-  var pulseListeners = [];
-  var pulseLast = null;
-  var pulseLastAt = 0;
-  var pulseBusy = false;
-  var navSparkSig = '';
-  var navSparkCleanups = [];
-
-  function onPulse(fn) {
-    var sub = { fn: fn };
-    pulseListeners.push(sub);
-    if (pulseLast) {
-      try { fn(pulseLast); } catch (e) { /* listener errors are isolated */ }
-    }
-    return function () {
-      var i = pulseListeners.indexOf(sub);
-      if (i >= 0) { pulseListeners.splice(i, 1); }
-    };
-  }
-
-  function pulse() {
-    if (pulseBusy) { return Promise.resolve(pulseLast); }
-    pulseBusy = true;
-    return fetchJSON('/api/pulse').then(function (payload) {
-      pulseBusy = false;
-      pulseLast = payload || {};
-      pulseLastAt = Date.now();
-      renderPulseChrome(pulseLast);
-      for (var i = 0; i < pulseListeners.length; i++) {
-        try { pulseListeners[i].fn(pulseLast); } catch (e) { /* isolated */ }
-      }
-      return pulseLast;
-    }, function () {
-      pulseBusy = false;
-      var banner = document.getElementById('updated');
-      if (banner) { banner.textContent = 'pulse offline'; }
-      return null;
+    var active = ranked.filter(function (r) { return r.total > 0; });
+    var maxT = active[0] ? active[0].total : 1;
+    var rankEl = root.querySelector('#ov-rank');
+    var list = el('div', 'hbar-list');
+    active.slice(0, 8).forEach(function (r) {
+      list.appendChild(el('div', 'hbar-row',
+        '<span class="hbar-name">' + esc(r.m.key) + '</span>' +
+        '<span class="hbar-track"><span class="hbar-fill" style="width:' + Math.max(1.5, r.total / maxT * 100).toFixed(1) + '%;background:' + modelColor(r.i) + '"></span></span>' +
+        '<span class="hbar-val">' + fmtBig(r.total) + ' <span style="color:var(--faint);font-weight:400">' + fmtPct(r.o.hitRate) + '</span></span>'));
     });
-  }
+    rankEl.appendChild(list);
 
-  function renderPulseChrome(p) {
-    var banner = document.getElementById('updated');
-    if (banner) {
-      var d = new Date((p && p.generatedAt) ? p.generatedAt : new Date());
-      var txt = 'updated ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
-      if (p && p.latest && p.latest.provider) { txt += ' \u00b7 ' + p.latest.provider; }
-      banner.textContent = txt;
-    }
-    renderNavSparks(p);
-  }
-
-  function renderNavSparks(p) {
-    var hosts = document.querySelectorAll('.nav-spark');
-    if (!hosts.length) { return; }
-    var values = [];
-    (p && p.last7 || []).forEach(function (pt) { values.push(Number(pt && pt.tokens) || 0); });
-    var sig = values.join(',');
-    if (sig === navSparkSig) { return; }
-    navSparkSig = sig;
-    while (navSparkCleanups.length) {
-      try { navSparkCleanups.pop()(); } catch (e) { /* already detached */ }
-    }
-    for (var i = 0; i < hosts.length; i++) {
-      hosts[i].innerHTML = '';
-      if (window.XUChart && typeof XUChart.sparkline === 'function') {
-        var clean = XUChart.sparkline(hosts[i], {
-          values: values, color: colors.accent, width: 54, height: 12
-        });
-        if (typeof clean === 'function') { navSparkCleanups.push(clean); }
-      }
-    }
-  }
-
-  // ---- boot ----------------------------------------------------------------------------
-
-  function boot() {
-    initNav();
-    initControls();
-    syncControls();
-    startClock();
-    window.addEventListener('hashchange', route);
-    route();
-
-    // One meta fetch for the version footer; the rescan button refreshes it.
-    fetchJSON('/api/meta').then(renderFoot).catch(function () { /* offline */ });
-
-    // Prefetch common endpoints in parallel to warm connections (§13.0.1).
-    prefetch([
-      '/api/meta', '/api/summary', '/api/pulse',
-      '/api/models' + q() + (q() ? '&' : '?') + 'trend=1',
-      '/api/providers', '/api/blocks' + q()
-    ]);
-
-    document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && mounted) { route(); }
+    donut(root.querySelector('#ov-donut'), {
+      slices: active.slice(0, 6).map(function (r) { return { name: r.m.key, value: r.total, color: modelColor(r.i), hitRate: r.o.hitRate }; }),
+      center: { value: fmtBig(tot.tokens), label: 'tokens' }, yFormat: fmtBig
     });
-  }
-
-  // ---- export ----------------------------------------------------------------------------
-
-  window.XU = {
-    version: '2.0.0',
-    fetch: fetchJSON,
-    post: postJSON,
-    q: q,
-    state: state,
-    setState: setState,
-    onState: onState,
-    fmt: fmt,
-    colors: colors,
-    colorFor: colorFor,
-    pill: pill,
-    pulse: pulse,
-    onPulse: onPulse,
-    registerView: registerView,
-    views: views,
-    viewList: VIEWS,
-    currentView: function () { return currentView; },
-    navigate: function (hash) { location.hash = hash; },
-    show: show,
-    toast: toast,
-    el: el,
-    esc: esc,
-    skeletonRows: skeletonRows,
-    downloadCSV: downloadCSV,
-    // instant-load layer (§13.0.1)
-    cacheGet: cacheGet,
-    cacheSet: cacheSet,
-    swr: swr,
-    prefetch: prefetch,
-    // range helpers
-    rangeBounds: rangeBounds
   };
 
-  // All scripts use `defer`, so they run in document order: app.js boots before
-  // the view scripts register themselves. readyState is already 'interactive'
-  // here, so waiting for 'loading'->DOMContentLoaded never fires — boot() would
-  // run route() with zero views registered ("Unknown view"). Wait for `load`,
-  // which only fires after every defer script (all views) has executed.
-  if (document.readyState === 'complete') {
-    boot();
-  } else {
-    window.addEventListener('load', boot);
+  function kpiCard(key, val, sub, spark, sparkColor) {
+    return '<div class="card kpi">' +
+      '<div class="kpi-key">' + esc(key) + '</div>' +
+      '<div class="kpi-val">' + val + '</div>' +
+      (sub ? '<div class="kpi-sub">' + sub + '</div>' : '') +
+      (spark ? '<div class="kpi-spark" data-spark=\'' + JSON.stringify(spark) + '\' data-color="' + sparkColor + '"></div>' : '') +
+      '</div>';
   }
+
+  views.timeline = function (root) {
+    var days = rangedDays();
+    if (!days.length) { root.innerHTML = '<div class="empty">No data for this range.</div>'; return; }
+    var labels = days.map(function (d) { return fmtDate(d.date || d.key); });
+
+    var html = secLabel('timeline') +
+      '<div class="card"><div class="card-title">stacked tokens / day</div>' +
+      '<div id="tl-bars"></div>' +
+      '<div class="legend">' + legendItem('input', C.input) + legendItem('output', C.output) + legendItem('cache read', C.cread) + legendItem('cache create', C.ccreate) + '</div></div>' +
+      '<div style="height:12px"></div>' +
+      '<div class="card"><div class="card-title">cost / day</div><div id="tl-cost"></div></div>' +
+      secLabel('day by day') +
+      '<div class="card table-wrap"><table class="table"><thead><tr>' +
+      '<th>date</th><th class="n">total</th><th class="n">input</th><th class="n">output</th>' +
+      '<th class="n">cache read</th><th class="n">hit rate</th><th class="n">cost</th><th class="n">sessions</th>' +
+      '</tr></thead><tbody id="tl-rows"></tbody></table></div>';
+
+    root.innerHTML = html;
+
+    barChart(root.querySelector('#tl-bars'), {
+      groups: days.map(function (d) {
+        var parts = [{ name: 'input', value: 0, color: C.input }, { name: 'output', value: 0, color: C.output }, { name: 'cache read', value: 0, color: C.cread }, { name: 'cache create', value: 0, color: C.ccreate }];
+        (d.models || []).forEach(function (m) { parts[0].value += m.inputTokens || 0; parts[1].value += m.outputTokens || 0; parts[2].value += m.cacheReadTokens || 0; parts[3].value += m.cacheCreationTokens || 0; });
+        return { label: fmtDate(d.date || d.key), tipTitle: fmtDateLong(d.date || d.key), parts: parts };
+      }),
+      height: 240, yFormat: fmtBig,
+      tipExtra: function (i) { return '<div class="tt-row"><span><i style="background:' + C.cread + '"></i>cache hit</span><b>' + fmtPct(dayHitRate(days[i])) + '</b></div>'; }
+    });
+
+    lineChart(root.querySelector('#tl-cost'), {
+      series: [{ name: 'cost', color: C.accent, values: days.map(dayCost) }],
+      labels: labels, height: 170, area: true, yFormat: fmtCost,
+      tipTitle: function (i) { return fmtDateLong(days[i].date || days[i].key); },
+      tipExtra: function (i) { return '<div class="tt-row"><span><i style="background:' + C.cread + '"></i>cache hit</span><b>' + fmtPct(dayHitRate(days[i])) + '</b></div>'; }
+    });
+
+    var tbody = root.querySelector('#tl-rows');
+    var rowsHtml = '';
+    days.slice().reverse().forEach(function (d) {
+      var agg = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+      (d.models || []).forEach(function (m) { agg.input += m.inputTokens || 0; agg.output += m.outputTokens || 0; agg.cacheRead += m.cacheReadTokens || 0; agg.cacheCreate += m.cacheCreationTokens || 0; });
+      var tot = agg.input + agg.output + agg.cacheRead + agg.cacheCreate;
+      rowsHtml += '<tr>' +
+        '<td class="strong">' + esc(fmtDate(d.date || d.key)) + '</td>' +
+        '<td class="n strong">' + fmtBig(tot) + '</td>' +
+        '<td class="n"><span class="tok-chip" style="background:' + C.input + '"></span>' + fmtBig(agg.input) + '</td>' +
+        '<td class="n"><span class="tok-chip" style="background:' + C.output + '"></span>' + fmtBig(agg.output) + '</td>' +
+        '<td class="n"><span class="tok-chip" style="background:' + C.cread + '"></span>' + fmtBig(agg.cacheRead) + '</td>' +
+        '<td class="n">' + fmtPct(hitRate(agg.input, agg.cacheRead)) + '</td>' +
+        '<td class="n">' + fmtCost(dayCost(d)) + '</td>' +
+        '<td class="n">' + (d.sessions || 0) + '</td></tr>';
+    });
+    tbody.innerHTML = rowsHtml;
+  };
+
+  views.models = function (root) {
+    var days = rangedDays();
+    var mt = modelTotals(days);
+    var ranked = MODELS.map(function (m, i) {
+      var o = mt[m.key] || { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, cost: 0 };
+      return { m: m, i: i, o: o, total: o.input + o.output + o.cacheRead + o.cacheCreate };
+    }).sort(function (a, b) { return b.total - a.total; });
+    var grand = ranked.reduce(function (s, r) { return s + r.total; }, 0) || 1;
+
+    var activeModels = ranked.filter(function (r) { return r.total > 0; });
+    var html = secLabel('models') +
+      '<div class="grid g-main">' +
+      '<div class="card table-wrap"><table class="table"><thead><tr>' +
+      '<th>#</th><th>model</th><th>vendor</th><th class="n">total</th><th class="n">share</th>' +
+      '<th class="n">input</th><th class="n">output</th><th class="n">cache</th><th class="n">hit rate</th><th class="n">cost</th>' +
+      '</tr></thead><tbody>';
+
+    activeModels.forEach(function (r, ri) {
+      var cache = r.o.cacheRead + r.o.cacheCreate;
+      html += '<tr>' +
+        '<td class="n" style="color:var(--faint)">' + (ri + 1) + '</td>' +
+        '<td class="strong"><span class="tok-chip" style="background:' + modelColor(r.i) + '"></span>' + esc(r.m.key) + '</td>' +
+        '<td>' + esc(r.m.vendor || 'Other') + '</td>' +
+        '<td class="n strong">' + fmtBig(r.total) + '</td>' +
+        '<td class="n">' + (r.total / grand * 100).toFixed(1) + '%</td>' +
+        '<td class="n">' + fmtBig(r.o.input) + '</td>' +
+        '<td class="n">' + fmtBig(r.o.output) + '</td>' +
+        '<td class="n">' + fmtBig(cache) + '</td>' +
+        '<td class="n">' + fmtPct(r.o.hitRate) + '</td>' +
+        '<td class="n">' + fmtCost(r.o.cost) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table></div>' +
+      '<div style="display:flex;flex-direction:column;gap:12px">' +
+        '<div class="card"><div class="card-title">cost share</div><div id="md-donut"></div></div>' +
+        '<div class="card"><div class="card-title">top model · 7d trend</div><div id="md-spark"></div>' +
+        '<div class="legend">' + legendItem(activeModels[0] ? activeModels[0].m.key : '', modelColor(activeModels[0] ? activeModels[0].i : 0)) + '</div></div>' +
+      '</div></div>';
+
+    root.innerHTML = html;
+
+    var activeModels = ranked.filter(function (r) { return r.total > 0; });
+    donut(root.querySelector('#md-donut'), {
+      slices: activeModels.slice(0, 6).map(function (r) { return { name: r.m.key, value: r.o.cost, color: modelColor(r.i), hitRate: r.o.hitRate }; }),
+      center: { value: fmtCost(activeModels.reduce(function (s, r) { return s + r.o.cost; }, 0)), label: 'total cost' }, yFormat: fmtCost
+    });
+
+    var topKey = ranked[0] ? ranked[0].m.key : '';
+    var trend = DAYS.slice(-7).map(function (d) {
+      var t = 0; (d.models || []).forEach(function (m) { if ((m.model || m.key) === topKey) t += (m.inputTokens || 0) + (m.outputTokens || 0) + (m.cacheReadTokens || 0) + (m.cacheCreationTokens || 0); });
+      return t;
+    });
+    lineChart(root.querySelector('#md-spark'), {
+      series: [{ name: topKey, color: modelColor(ranked[0] ? ranked[0].i : 0), values: trend }],
+      labels: DAYS.slice(-7).map(function (d) { return fmtDate(d.date || d.key); }),
+      height: 130, area: true, yFormat: fmtBig,
+      tipTitle: function (i) { return fmtDateLong(DAYS.slice(-7)[i].date || DAYS.slice(-7)[i].key); },
+      tipExtra: function (i) {
+        var d = DAYS.slice(-7)[i]; var inp = 0, cr = 0;
+        (d.models || []).forEach(function (m) { if ((m.model || m.key) === topKey) { inp += m.inputTokens || 0; cr += m.cacheReadTokens || 0; } });
+        return '<div class="tt-row"><span><i style="background:' + C.cread + '"></i>cache hit</span><b>' + fmtPct(hitRate(inp, cr)) + '</b></div>';
+      }
+    });
+  };
+
+  views.agents = function (root) {
+    var days = rangedDays();
+    var tot = grandTotals(days);
+    var byVendor = {};
+    days.forEach(function (day) {
+      (day.models || []).forEach(function (md) {
+        var key = md.model || md.key;
+        var vendor = vendorFromKey(key);
+        var v = byVendor[vendor] || (byVendor[vendor] = { tokens: 0, cost: 0, sessions: 0, messages: 0, input: 0, cacheRead: 0 });
+        var t = (md.inputTokens || 0) + (md.outputTokens || 0) + (md.cacheReadTokens || 0) + (md.cacheCreationTokens || 0);
+        v.tokens += t; v.input += md.inputTokens || 0; v.cacheRead += md.cacheReadTokens || 0;
+        var dt = dayTotal(day);
+        if (dt > 0) v.cost += (Number(day.cost) || 0) * (t / dt);
+        v.messages += Math.round(t / 42000);
+      });
+    });
+    var totalTokens = Object.keys(byVendor).reduce(function (s, k) { return s + byVendor[k].tokens; }, 0) || 1;
+    Object.keys(byVendor).forEach(function (k) { byVendor[k].sessions = Math.round((tot.sessions || 0) * (byVendor[k].tokens / totalTokens)); });
+
+    var rows = Object.keys(byVendor).map(function (name, i) {
+      var v = byVendor[name];
+      return { name: name, i: i, tokens: v.tokens, cost: v.cost, sessions: v.sessions, messages: v.messages, hitRate: hitRate(v.input, v.cacheRead) };
+    }).sort(function (a, b) { return b.tokens - a.tokens; });
+    var maxT = rows[0] ? rows[0].tokens : 1;
+
+    var html = secLabel('agents', 'by token volume') + '<div class="grid g-2">';
+    rows.forEach(function (r) {
+      html += '<div class="card">' +
+        '<div class="card-title"><span><span class="tok-chip" style="background:' + modelColor(r.i) + '"></span>' + esc(r.name) + '</span><span class="card-note">' + r.sessions + ' sessions</span></div>' +
+        '<div style="display:flex;align-items:baseline;gap:14px">' +
+          '<span class="kpi-val" style="font-size:26px">' + fmtBig(r.tokens) + '</span>' +
+          '<span style="font:400 11px var(--font-mono);color:var(--muted)">' + fmtCost(r.cost) + ' · ' + fmtBig(r.messages) + ' msgs · ' + fmtPct(r.hitRate) + ' hit</span>' +
+        '</div>' +
+        '<div class="hbar-track" style="margin-top:14px"><div class="hbar-fill" style="width:' + (r.tokens / maxT * 100).toFixed(1) + '%;background:' + modelColor(r.i) + '"></div></div>' +
+      '</div>';
+    });
+    html += '</div>' +
+      secLabel('distribution', 'share of window') +
+      '<div class="card"><div id="ag-donut"></div></div>';
+
+    root.innerHTML = html;
+    donut(root.querySelector('#ag-donut'), {
+      slices: rows.map(function (r) { return { name: r.name, value: r.tokens, color: modelColor(r.i), hitRate: r.hitRate }; }),
+      center: { value: fmtBig(tot.tokens), label: 'tokens' }, yFormat: fmtBig, size: 190
+    });
+  };
+
+  var liveTimer = null;
+  views.live = function (root) {
+    var todayD = DAYS[DAYS.length - 1] || { models: [], sessions: 0, messages: 0, cost: 0 };
+    var tTok = dayTotal(todayD), tCost = dayCost(todayD);
+
+    var hours = [], hourLabels = [], hourHR = [];
+    for (var h = 0; h < 24; h++) {
+      var awake = h >= 7 && h <= 23 ? 1 : 0.08;
+      var peak = Math.exp(-Math.pow(h - 15, 2) / 30);
+      hours.push(Math.round(tTok / 24 * awake * (0.4 + peak * 1.6)));
+      hourLabels.push(String(h).padStart(2, '0'));
+      var dhr = hitRate(todayD.models.reduce(function (s, m) { return s + (m.inputTokens || 0); }, 0), todayD.models.reduce(function (s, m) { return s + (m.cacheReadTokens || 0); }, 0));
+      hourHR.push(+(dhr * (0.7 + peak * 0.3)).toFixed(2));
+    }
+
+    var activeBlock = (BLOCKS || []).filter(function (b) { return b.isActive; })[0];
+
+    var html = secLabel('live', 'today · ' + fmtDate(todayD.date || todayD.key || '')) +
+      '<div class="grid g-kpi">' +
+        kpiCard('tokens today', fmtBig(tTok), 'across ' + (todayD.sessions || 0) + ' sessions', null, null) +
+        kpiCard('cost today', fmtCost(tCost), 'all agents', null, null) +
+        kpiCard('cache hit rate', fmtPct(dayHitRate(todayD)), 'today · all agents', hourHR, C.cread) +
+        kpiCard('messages', fmtBig(todayD.messages || 0), 'all agents', null, null) +
+        kpiCard('burn rate', fmtBig(Math.round(tTok / 9)) + '<small>/hr</small>', 'projected ' + fmtBig(Math.round(tTok * 1.6)) + ' by eod', null, null) +
+      '</div>' +
+      '<div style="height:12px"></div>' +
+      '<div class="grid g-main">' +
+        '<div class="card"><div class="card-title">tokens / hour <span class="card-note">today</span></div><div id="lv-hours"></div></div>' +
+        '<div class="card"><div class="card-title">5h block <span class="card-note">billing window</span></div>' +
+          '<div class="gauge-wrap">' +
+            '<svg width="120" height="120" viewBox="0 0 120 120">' +
+              '<circle cx="60" cy="60" r="52" fill="none" stroke="var(--panel-2)" stroke-width="9"/>' +
+              '<circle cx="60" cy="60" r="52" fill="none" stroke="' + C.accent + '" stroke-width="9" stroke-linecap="round" stroke-dasharray="326.7" stroke-dashoffset="98" transform="rotate(-90 60 60)"/>' +
+              '<text x="60" y="58" text-anchor="middle" fill="var(--ink)" style="font:500 20px var(--font-mono)">' + (activeBlock ? '70%' : '—') + '</text>' +
+              '<text x="60" y="76" text-anchor="middle" fill="var(--faint)" style="font:400 8.5px var(--font-mono);letter-spacing:.14em">ELAPSED</text>' +
+            '</svg>' +
+            '<div class="gauge-meta">' +
+              '<div class="gauge-row"><span class="gk">started</span><span class="gv">' + (activeBlock ? fmtTime(activeBlock.startTime) : '—') + '</span></div>' +
+              '<div class="gauge-row"><span class="gk">resets</span><span class="gv">' + (activeBlock ? fmtTime(activeBlock.endTime) : '—') + '</span></div>' +
+              '<div class="gauge-row"><span class="gk">block tokens</span><span class="gv">' + fmtBig(activeBlock ? activeBlock.totalTokens : Math.round(tTok * 0.42)) + '</span></div>' +
+              '<div class="gauge-row"><span class="gk">projection</span><span class="gv" style="color:var(--accent)">' + (activeBlock ? 'within limit' : 'no active block') + '</span></div>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+      secLabel('recent activity', 'latest messages') +
+      '<div class="card"><div class="feed" id="lv-feed"></div></div>';
+
+    root.innerHTML = html;
+
+    barChart(root.querySelector('#lv-hours'), {
+      groups: hours.map(function (v, h) {
+        return { label: hourLabels[h], tipTitle: hourLabels[h] + ':00', parts: [{ name: 'tokens', value: v, color: C.accent }] };
+      }),
+      height: 190, yFormat: fmtBig,
+      tipExtra: function (i) { return '<div class="tt-row"><span><i style="background:' + C.cread + '"></i>cache hit</span><b>' + fmtPct(hourHR[i]) + '</b></div>'; }
+    });
+
+    var feed = root.querySelector('#lv-feed');
+    var feedRows = [];
+    var latest = (PULSE && PULSE.latest) ? PULSE.latest : null;
+    var recentModels = MODELS.slice(0, 6);
+    for (var f = 0; f < 9; f++) {
+      var m = recentModels[f % recentModels.length];
+      var when = new Date(Date.now() - f * (2 + (f * 37 % 9)) * 60000);
+      feedRows.push({ t: when.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }),
+        html: '<b>' + esc(m ? m.key : (latest && latest.model) || 'agent') + '</b>' + (latest && latest.provider ? ' → ' + esc(latest.provider) : ''),
+        v: fmtBig(Math.round(20000 + (f * 137 % 400) * 1000)) + ' tok' });
+    }
+    function renderFeed() {
+      feed.innerHTML = feedRows.map(function (r, i) {
+        return '<div class="feed-row' + (i === 0 ? ' fresh' : '') + '">' +
+          '<span class="ft">' + r.t + '</span><span class="fm">' + r.html + '</span><span class="fv">' + r.v + '</span></div>';
+      }).join('');
+    }
+    renderFeed();
+
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+    liveTimer = setInterval(function () {
+      var m = recentModels[Math.floor(Math.random() * recentModels.length)];
+      feedRows.unshift({ t: new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }),
+        html: '<b>' + esc(m ? m.key : 'agent') + '</b>', v: fmtBig(Math.round(20000 + Math.random() * 400000)) + ' tok' });
+      feedRows = feedRows.slice(0, 9);
+      renderFeed();
+    }, 6000);
+  };
+
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    var d = new Date(iso);
+    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+
+  var viewEl = document.getElementById('view');
+
+  function mount(route) {
+    state.route = route;
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+    document.querySelectorAll('.rail-item').forEach(function (b) { b.classList.toggle('active', b.dataset.route === route); });
+    viewEl.innerHTML = '';
+    var wrap = el('div', 'view');
+    viewEl.appendChild(wrap);
+    if (views[route]) views[route](wrap);
+    wrap.querySelectorAll('.kpi-spark').forEach(function (elS) { sparkline(elS, JSON.parse(elS.dataset.spark), elS.dataset.color); });
+  }
+
+  var rail = document.getElementById('rail');
+  if (rail) {
+    rail.addEventListener('click', function (ev) { var btn = ev.target.closest('.rail-item'); if (btn) mount(btn.dataset.route); });
+  }
+
+  document.addEventListener('keydown', function (ev) {
+    if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA') return;
+    var routes = ['overview', 'timeline', 'models', 'agents', 'live'];
+    var idx = parseInt(ev.key, 10) - 1;
+    if (idx >= 0 && idx < routes.length) mount(routes[idx]);
+  });
+
+  function segWire(id, attr, key) {
+    var seg = document.getElementById(id);
+    if (!seg) return;
+    seg.addEventListener('click', function (ev) {
+      var btn = ev.target.closest('button');
+      if (!btn) return;
+      this.querySelectorAll('button').forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      state[key] = btn.dataset[attr];
+      var win = document.getElementById('rail-window');
+      if (win) win.textContent = state.range;
+      mount(state.route);
+    });
+  }
+  segWire('seg-range', 'range', 'range');
+  segWire('seg-metric', 'metric', 'metric');
+
+  var exportBtn = document.getElementById('export-btn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', function () {
+      var days = rangedDays();
+      var csv = 'date,model,input,output,cache_read,cache_create,total,cost\n';
+      days.forEach(function (d) {
+        (d.models || []).forEach(function (m) {
+          var t = (m.inputTokens || 0) + (m.outputTokens || 0) + (m.cacheReadTokens || 0) + (m.cacheCreationTokens || 0);
+          if (!t) return;
+          csv += [d.date || d.key, m.model || m.key, m.inputTokens || 0, m.outputTokens || 0, m.cacheReadTokens || 0, m.cacheCreationTokens || 0, t, ''].join(',') + '\n';
+        });
+      });
+      var blob = new Blob([csv], { type: 'text/csv' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'xusage-' + state.range + '.csv';
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast('exported ' + days.length + ' days · ' + state.range);
+    });
+  }
+
+  var toastEl = document.getElementById('toast');
+  var toastT = null;
+  function toast(msg) {
+    if (!toastEl) return;
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toastT);
+    toastT = setTimeout(function () { toastEl.classList.remove('show'); }, 2200);
+  }
+
+  function tickClock() {
+    var c = document.getElementById('clock');
+    if (c) c.textContent = new Date().toLocaleTimeString(undefined, { hour12: false });
+  }
+  tickClock();
+  setInterval(tickClock, 1000);
+
+  var railUpdated = document.getElementById('rail-updated');
+  if (railUpdated) railUpdated.textContent = new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+
+  function boot() {
+    Promise.all([
+      api('/api/daily'),
+      api('/api/models?trend=1'),
+      api('/api/summary'),
+      api('/api/pulse'),
+      api('/api/blocks?limit=8'),
+    ]).then(function (res) {
+      var daily = res[0] || [];
+      var modelRows = res[1] || [];
+      SUMMARY = res[2] || {};
+      PULSE = res[3] || {};
+      BLOCKS = res[4] || {};
+
+      DAYS = daily.map(function (d) {
+        var models = (d.models || []).map(function (m) {
+          return { model: m.model || m.key, vendor: m.vendor || vendorFromKey(m.model || m.key),
+            inputTokens: m.inputTokens || 0, outputTokens: m.outputTokens || 0,
+            cacheReadTokens: m.cacheReadTokens || 0, cacheCreationTokens: m.cacheCreationTokens || 0, cost: m.cost || 0 };
+        });
+        return { date: d.key || d.date, models: models, sessions: d.sessions || 0, messages: d.messages || 0, cost: d.cost || 0 };
+      });
+
+      MODELS = buildModels(DAYS, modelRows);
+
+      var win = document.getElementById('rail-window');
+      if (win) win.textContent = state.range;
+      var updated = document.getElementById('rail-updated');
+      if (updated) updated.textContent = new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+
+      mount('overview');
+    }).catch(function () {
+      if (viewEl) viewEl.innerHTML = '<div class="empty">Failed to load data. Is the xusage server running?</div>';
+    });
+  }
+
+  var rzT = null;
+  window.addEventListener('resize', function () { clearTimeout(rzT); rzT = setTimeout(function () { mount(state.route); }, 180); });
+
+  boot();
 })();

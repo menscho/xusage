@@ -4,11 +4,16 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
 // parseAliases parses XUSAGE_MODEL_ALIASES: either a JSON object
 // {"from":"to"} or a comma/semicolon/newline-separated "from=to" list.
+// Keys and values are deliberately NOT interned: the alias table is
+// config-sized (a handful of pairs), its targets are matched against the
+// pricing table's own non-interned keys, and Go map lookup is value-based —
+// interning would only pin permanent, useless entries in the global intern
+// table. Parsing runs only on an env change, so this stays off the hot path.
 func parseAliases(raw string) map[string]string {
 	out := map[string]string{}
 	trimmed := strings.TrimSpace(raw)
@@ -58,38 +63,64 @@ func parseAliases(raw string) map[string]string {
 	return out
 }
 
-// aliasCache memoizes the parsed XUSAGE_MODEL_ALIASES value. The cache is
-// keyed on the raw env string so tests (and live env changes) take effect on
-// the next lookup instead of being pinned by sync.Once.
-var (
-	aliasMu     sync.RWMutex
-	aliasRaw    string
-	aliasParsed bool
-	aliasMap    map[string]string
+// aliasCache is the frozen, immutable alias table published once parsed. The
+// map is never mutated after construction, so it can be shared lock-free via
+// the atomic pointer below — readers pay only a single atomic load instead of
+// taking the RWMutex on every lookup.
+type aliasCache struct {
+	raw string
+	m   map[string]string
+}
+
+var aliasStore atomic.Pointer[aliasCache]
+
+// envAliasesState tracks whether XUSAGE_MODEL_ALIASES has ever been observed
+// as set. The common case is that the variable stays unset for the whole
+// process lifetime; probing it on every lookup still costs os.Getenv, which
+// allocates on every call (2 allocs/op on Windows) even when the variable is
+// absent. After the first lookup the state settles to either aliasesEmpty
+// (never call os.Getenv again — zero-cost steady state) or aliasesSet (probe
+// each lookup so config changes are still picked up). The zero value means
+// "unprobed".
+var envAliasesState atomic.Uint32
+
+const (
+	aliasesUnprobed = iota
+	aliasesEmpty
+	aliasesSet
 )
 
-// resetAliasCache drops the memoized alias table; used by tests.
+// resetAliasCache drops all memoized alias state; used by tests after they
+// change XUSAGE_MODEL_ALIASES. It resets both the parsed-alias table and the
+// env-set probe so a later lookup re-probes from scratch.
 func resetAliasCache() {
-	aliasMu.Lock()
-	defer aliasMu.Unlock()
-	aliasRaw, aliasParsed, aliasMap = "", false, nil
+	envAliasesState.Store(aliasesUnprobed)
+	aliasStore.Store(nil)
 }
 
 // lookupAlias returns the alias target for model, or "" when none applies.
 func lookupAlias(model string) string {
-	raw := os.Getenv("XUSAGE_MODEL_ALIASES")
-	aliasMu.RLock()
-	cached := aliasParsed && aliasRaw == raw
-	m := aliasMap
-	aliasMu.RUnlock()
-	if !cached {
-		m = parseAliases(raw)
-		aliasMu.Lock()
-		aliasRaw, aliasParsed, aliasMap = raw, true, m
-		aliasMu.Unlock()
+	var raw string
+	switch state := envAliasesState.Load(); state {
+	case aliasesSet:
+		raw = os.Getenv("XUSAGE_MODEL_ALIASES")
+	case aliasesUnprobed:
+		raw = os.Getenv("XUSAGE_MODEL_ALIASES")
+		if raw != "" {
+			envAliasesState.Store(aliasesSet)
+		} else {
+			envAliasesState.Store(aliasesEmpty)
+		}
 	}
-	if m == nil {
+	// aliasesEmpty: raw stays "" — zero-cost steady state; os.Getenv never called.
+	cur := aliasStore.Load()
+	if cur == nil || cur.raw != raw {
+		m := parseAliases(raw)
+		cur = &aliasCache{raw: raw, m: m}
+		aliasStore.Store(cur)
+	}
+	if cur.m == nil {
 		return ""
 	}
-	return m[model]
+	return cur.m[model]
 }

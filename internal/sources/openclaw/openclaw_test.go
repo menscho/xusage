@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"xusage/internal/model"
 )
 
 // write writes rel under dir with the given content, creating parents.
@@ -478,5 +476,3 @@ func TestEntryIDShape(t *testing.T) {
 		t.Error("different token splits must produce different ids")
 	}
 }
-
-var _ = model.Entry{} // keep the model import anchored if helpers change

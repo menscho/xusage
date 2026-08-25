@@ -6,23 +6,127 @@ package adapter
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+// discoveryCacheTTL bounds how long a cached discovery survives without a
+// full re-walk. The root-mtime sentinel handles the common case (unchanged
+// tree -> skip the walk); this backstop guarantees a nested addition is
+// noticed even when an ancestor dir's mtime happens to match, and prevents
+// an atrophied entry from living forever. Tuned well above the 2s poll
+// interval so steady-state polls never re-walk.
+const discoveryCacheTTL = 30 * time.Second
+
+// discoveryCacheMax bounds the number of distinct (root, ext) keys the
+// discovery cache may hold. Real sources resolve to a handful of stable
+// directories, so this is a defensive ceiling: if ever exceeded (e.g. a
+// misconfigured env var producing a new root every poll) the cache is
+// reset on the next insert so it cannot grow without bound.
+const discoveryCacheMax = 64
+
+// discoveryKey identifies one cached CollectFiles result. A struct key
+// avoids the per-call string-concat allocation that a "root\x00ext" key
+// would otherwise require on every poll, and cannot collide the way a
+// joined string could (("a","bc") vs ("ab","c")).
+type discoveryKey struct {
+	root string
+	ext  string
+}
+
+// discoveryEntry is one cached CollectFiles result plus the root-mtime
+// sentinel and the time it was stored (for the TTL backstop). The files
+// slice is cap-pinned (len == cap) so a caller that appends to it cannot
+// scribble on the cache's backing array.
+type discoveryEntry struct {
+	files  []string
+	mtime  time.Time
+	stored time.Time
+}
+
+var (
+	discoveryMu    sync.Mutex
+	discoveryCache = map[discoveryKey]discoveryEntry{}
+)
+
+// interned holds process-wide interned strings. Model and provider names
+// repeat across thousands of entries (e.g. one "claude-sonnet-4-..." string
+// per entry in a large transcript); interning shares a single backing array
+// per distinct value. The set of distinct names across all providers and
+// history is small and bounded (low hundreds), so this map does not grow
+// without limit. Lookups dominate writes once warm, but a plain Mutex keeps
+// the lookup hot path smaller than a sync.Map for a map this small.
+var (
+	internMu sync.Mutex
+	interned = map[string]string{}
+)
+
+// Intern returns a shared instance of s: the first call for a given value
+// records it and every later call with an equal string returns the same
+// pointer. Intern only strings you know are long-lived and repeatedly seen
+// (model/provider names); do not intern high-cardinality values like ids or
+// raw line content. Safe for concurrent use from the engine's parallel parse
+// workers.
+func Intern(s string) string {
+	if s == "" {
+		return ""
+	}
+	internMu.Lock()
+	if g, ok := interned[s]; ok {
+		internMu.Unlock()
+		return g
+	}
+	interned[s] = s
+	internMu.Unlock()
+	return s
+}
 
 // CollectFiles walks root recursively and appends every regular file whose
 // name ends with ext (with or without the leading dot). A missing or
 // unreadable root is not an error — it simply yields no files.
+//
+// Results are memoized per (root, ext): a poll whose root directory mtime is
+// unchanged since the last walk returns the cached list instead of
+// re-reading the tree, so the 2s discovery tick costs a single os.Stat in
+// steady state. The TTL eventually forces a re-walk to bound staleness.
 func CollectFiles(root, ext string) []string {
 	if ext != "" && ext[0] != '.' {
 		ext = "." + ext
 	}
+	if ext != "" {
+		ext = strings.ToLower(ext)
+	}
+	key := discoveryKey{root: root, ext: ext}
+
+	fi, statErr := os.Stat(root)
+	var mtime time.Time
+	if statErr == nil {
+		mtime = fi.ModTime().UTC()
+	}
+
+	discoveryMu.Lock()
+	if e, ok := discoveryCache[key]; ok && time.Since(e.stored) < discoveryCacheTTL && e.mtime.Equal(mtime) {
+		discoveryMu.Unlock()
+		return e.files
+	}
+	discoveryMu.Unlock()
+
 	var files []string
 	collect(root, ext, &files)
+	files = files[:len(files):len(files)] // pin cap: append-safe cache line
+
+	discoveryMu.Lock()
+	if len(discoveryCache) >= discoveryCacheMax {
+		// Pathological growth (e.g. a new root every poll): reset rather
+		// than accumulate without bound. The next poll repopulates.
+		discoveryCache = map[discoveryKey]discoveryEntry{}
+	}
+	discoveryCache[key] = discoveryEntry{files: files, mtime: mtime, stored: time.Now()}
+	discoveryMu.Unlock()
 	return files
 }
 
@@ -32,7 +136,8 @@ func collect(root, ext string, out *[]string) {
 		return
 	}
 	for _, e := range entries {
-		p := filepath.Join(root, e.Name())
+		name := e.Name()
+		p := filepath.Join(root, name)
 		if e.IsDir() {
 			collect(p, ext, out)
 			continue
@@ -40,10 +145,22 @@ func collect(root, ext string, out *[]string) {
 		if !e.Type().IsRegular() {
 			continue // skip symlinks and oddities
 		}
-		if ext == "" || strings.HasSuffix(strings.ToLower(e.Name()), strings.ToLower(ext)) {
+		if ext == "" || hasSuffixCI(name, ext) {
 			*out = append(*out, p)
 		}
 	}
+}
+
+// hasSuffixCI reports whether name ends with ext, ignoring case. ext is
+// assumed already lowercased (CollectFiles normalizes it before calling
+// collect). The tail slice shares name's backing array, and EqualFold
+// compares without allocating — so this avoids the per-file string copy
+// that strings.ToLower(name) would otherwise require.
+func hasSuffixCI(name, ext string) bool {
+	if len(name) < len(ext) {
+		return false
+	}
+	return strings.EqualFold(name[len(name)-len(ext):], ext)
 }
 
 // SortStrings sorts paths in place so discovery output is deterministic.
@@ -90,23 +207,29 @@ func ExistingDirs(raw string, defaults ...string) []string {
 // trimmed; empty values read as unset.
 func Env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
 
-// ParseTimestamp parses the timestamp formats seen across coding-agent logs:
-// RFC3339 with fractional seconds, plain RFC3339, "2006-01-02 15:04:05", and
-// date-only. The zero time is returned when nothing matches.
+// timestampLayouts are the timestamp formats seen across coding-agent logs,
+// tried in order. Package-level so the per-call range allocation (one slice
+// per parsed line) is paid once at init; the slice is read-only afterward and
+// safe for concurrent use.
+var timestampLayouts = []string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05Z0700",
+	"2006-01-02",
+}
+
+// ParseTimestamp parses one of the timestamp formats seen across coding-agent
+// logs: RFC3339 with fractional seconds, plain RFC3339, "2006-01-02 15:04:05",
+// and date-only. The zero time is returned when nothing matches.
 func ParseTimestamp(s string) time.Time {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return time.Time{}
 	}
-	for _, layout := range []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02T15:04:05.999999999",
-		"2006-01-02 15:04:05.999999999Z07:00",
-		"2006-01-02 15:04:05",
-		"2006-01-02T15:04:05Z0700",
-		"2006-01-02",
-	} {
+	for _, layout := range timestampLayouts {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC()
 		}
@@ -226,5 +349,3 @@ func FirstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-
-var _ = fmt.Sprintf // keep fmt available for adapters importing this file's siblings

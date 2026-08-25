@@ -4,7 +4,11 @@
 // internal/sources/all.
 package sources
 
-import "xusage/internal/model"
+import (
+	"sync"
+
+	"xusage/internal/model"
+)
 
 // Source describes one coding-agent data source.
 type Source struct {
@@ -22,7 +26,8 @@ type Source struct {
 var registered []Source
 
 // Register adds a source to the registry. Later registrations with a duplicate
-// Name replace the earlier one.
+// Name replace the earlier one. Only called from adapter init() functions,
+// which run single-threaded before main; the registry is immutable afterwards.
 func Register(s Source) {
 	for i := range registered {
 		if registered[i].Name == s.Name {
@@ -33,24 +38,46 @@ func Register(s Source) {
 	registered = append(registered, s)
 }
 
-// All returns the registered sources sorted by name.
-func All() []Source {
-	out := make([]Source, len(registered))
-	copy(out, registered)
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j].Name < out[j-1].Name; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
+// registry is the lazily-built, immutable, sorted view of registered.
+// Built once on first use: Register finishes during init (before main) while
+// All/Names are only called afterwards from the poller and HTTP handlers, so a
+// single build is safe and needs no locking on the hot path. The slices are
+// shared and must be treated as read-only by callers.
+var (
+	regOnce  sync.Once
+	regAll   []Source
+	regNames []string
+)
+
+func buildRegistry() {
+	// Transfer ownership of the backing array: Register only runs during init
+	// (before the first All/Names call), so once buildRegistry runs the
+	// registration slice is never appended to again. Reusing its array here
+	// avoids a fresh allocation + copy; nil'ing registered drops the only other
+	// reference so the engine can release it once regAll is swept.
+	regAll = registered
+	registered = nil
+	for i := 1; i < len(regAll); i++ {
+		for j := i; j > 0 && regAll[j].Name < regAll[j-1].Name; j-- {
+			regAll[j], regAll[j-1] = regAll[j-1], regAll[j]
 		}
 	}
-	return out
+	regNames = make([]string, len(regAll))
+	for i, s := range regAll {
+		regNames[i] = s.Name
+	}
 }
 
-// Names returns the registered source names in sorted order.
+// All returns the registered sources sorted by name. The returned slice is
+// shared across callers and must not be modified.
+func All() []Source {
+	regOnce.Do(buildRegistry)
+	return regAll
+}
+
+// Names returns the registered source names in sorted order. The returned
+// slice is shared across callers and must not be modified.
 func Names() []string {
-	all := All()
-	names := make([]string, len(all))
-	for i, s := range all {
-		names[i] = s.Name
-	}
-	return names
+	regOnce.Do(buildRegistry)
+	return regNames
 }

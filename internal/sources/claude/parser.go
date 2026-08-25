@@ -1,12 +1,14 @@
 package claude
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
 
 	"xusage/internal/model"
+	"xusage/internal/sources/adapter"
 )
 
 // usageBlock mirrors message.usage. Token fields are optPtr so an explicit
@@ -96,8 +98,17 @@ var nullFields = map[string]bool{
 // anywhere in the raw line. It scans for ":null" and inspects the key that
 // immediately precedes it, mirroring upstream has_unsupported_null_field.
 func hasUnsupportedNullField(line string) bool {
+	return hasUnsupportedNullFieldBytes([]byte(line))
+}
+
+// hasUnsupportedNullFieldBytes does the scan on a byte slice so the parser can
+// pass the scanner's reused buffer and avoid a per-line string→bytes
+// allocation. It keeps the same textual ":null" + preceding-key logic as the
+// string version; the string entry point (called by tests) wraps it.
+func hasUnsupportedNullFieldBytes(line []byte) bool {
+	needle := []byte(":null")
 	for i := 0; i+5 <= len(line); {
-		j := strings.Index(line[i:], ":null")
+		j := bytes.Index(line[i:], needle)
 		if j < 0 {
 			return false
 		}
@@ -113,7 +124,7 @@ func hasUnsupportedNullField(line string) bool {
 			for start > 0 && line[start] != '"' {
 				start--
 			}
-			if line[start] == '"' && nullFields[line[start+1:end]] {
+			if line[start] == '"' && nullFields[string(line[start+1:end])] {
 				return true
 			}
 		}
@@ -161,14 +172,22 @@ func parseTimestamp(s string) (time.Time, bool) {
 // transcript's own path (used for session/project extraction); passing it
 // explicitly keeps parsing safe under the engine's parallel worker pool.
 func parseLine(line, relPath string) ([]model.Entry, bool) {
-	if !strings.Contains(line, `"usage":{`) { // fast prefilter
+	return parseLineBytes([]byte(line), relPath)
+}
+
+// parseLineBytes does the real work on a byte slice, so the engine's parallel
+// parse workers can pass the scanner's reused buffer (sc.Bytes()) and skip a
+// per-line string→bytes allocation. The string parseLine wrapper preserves the
+// call signature for tests.
+func parseLineBytes(line []byte, relPath string) ([]model.Entry, bool) {
+	if !bytes.Contains(line, []byte(`"usage":{`)) { // fast prefilter
 		return nil, false
 	}
-	if hasUnsupportedNullField(line) {
+	if hasUnsupportedNullFieldBytes(line) {
 		return nil, false
 	}
 	var rl rawLine
-	if err := json.Unmarshal([]byte(line), &rl); err != nil {
+	if err := json.Unmarshal(line, &rl); err != nil {
 		return nil, false
 	}
 	ts, ok := parseTimestamp(rl.Timestamp)
@@ -196,6 +215,8 @@ func parseLine(line, relPath string) ([]model.Entry, bool) {
 	if fast {
 		modelName += "-fast"
 	}
+	modelName = adapter.Intern(modelName)
+	rawModel := adapter.Intern(*rl.Message.Model)
 	cc5m := uint64(0)
 	if u.CacheCreationTokens != nil {
 		cc5m = *u.CacheCreationTokens
@@ -207,11 +228,13 @@ func parseLine(line, relPath string) ([]model.Entry, bool) {
 	}
 	sessionID, _ := extractSessionParts(relPath)
 	e := model.Entry{
-		ID:                  *rl.Message.ID,
-		RequestID:           deref(rl.RequestID),
+		ID: *rl.Message.ID,
+		// RequestID repeats across the main entry and each advisor sub-entry
+		// copied from it, so intern it to share one backing array per turn.
+		RequestID:           adapter.Intern(deref(rl.RequestID)),
 		Timestamp:           ts,
 		Model:               modelName,
-		RawModel:            *rl.Message.Model,
+		RawModel:            rawModel,
 		SessionID:           sessionID,
 		Version:             deref(rl.Version),
 		InputTokens:         u.InputTokens,
@@ -226,7 +249,10 @@ func parseLine(line, relPath string) ([]model.Entry, bool) {
 		IsAPIError:          rl.IsAPIErrorMessage != nil && *rl.IsAPIErrorMessage,
 		UsageLimitReset:     usageLimitReset(line, rl.IsAPIErrorMessage),
 	}
-	entries := []model.Entry{e}
+	// Pre-size to the worst case (one entry per iteration) so the advisor loop
+	// never reallocates the per-line slice.
+	entries := make([]model.Entry, 0, 1+len(u.Iterations))
+	entries = append(entries, e)
 	// Advisor iterations become their own entries under the advisor model with
 	// no reported cost, mirroring upstream advisor_usages_from_line. The id
 	// gets an ":advisor:<n>" suffix so dedup keeps them distinct from the
@@ -246,8 +272,9 @@ func parseLine(line, relPath string) ([]model.Entry, bool) {
 		}
 		a := e
 		a.ID = e.ID + ":advisor:" + strconv.Itoa(i)
-		a.Model = *it.Model
-		a.RawModel = *it.Model
+		am := adapter.Intern(*it.Model)
+		a.Model = am
+		a.RawModel = am
 		a.InputTokens = it.InputTokens
 		a.OutputTokens = it.OutputTokens
 		a.CacheCreationTokens = cc5
@@ -269,23 +296,24 @@ func deref(s *string) string {
 }
 
 // usageLimitReset extracts the epoch-seconds reset stamp from Claude's
-// "Claude AI usage limit reached(...)|<unix>" API error text.
-func usageLimitReset(line string, isAPIError *bool) *time.Time {
+// "Claude AI usage limit reached(...)|<unix>" API error text. It takes bytes so
+// the hot path can pass the scanner's reused buffer directly.
+func usageLimitReset(line []byte, isAPIError *bool) *time.Time {
 	if isAPIError == nil || !*isAPIError {
 		return nil
 	}
 	const marker = "Claude AI usage limit reached"
-	i := strings.Index(line, marker)
+	i := bytes.Index(line, []byte(marker))
 	if i < 0 {
 		return nil
 	}
 	rest := line[i+len(marker):]
-	pipe := strings.IndexByte(rest, '|')
+	pipe := bytes.IndexByte(rest, '|')
 	if pipe < 0 {
 		return nil
 	}
 	rest = rest[pipe+1:]
-	rest = strings.TrimLeft(rest, " \t")
+	rest = bytes.TrimLeft(rest, " \t")
 	end := 0
 	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
 		end++

@@ -2,6 +2,7 @@ package codex
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"strings"
@@ -51,7 +52,12 @@ func parse(path string) ([]model.Entry, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
-		line := sc.Text()
+		// sc.Bytes() returns the scanner's internal buffer, reused on every
+		// scan. The per-line helpers decode the line fully before returning —
+		// no json.RawMessage is retained past the call — so handing the buffer
+		// straight through skips a per-line []byte(line) allocation that
+		// sc.Text() + string-to-bytes would do.
+		line := sc.Bytes()
 		switch classifyLine(line) {
 		case lineSession:
 			e, ok := p.sessionEvent(line)
@@ -72,18 +78,18 @@ func parse(path string) ([]model.Entry, error) {
 // does: session records (session_meta / turn_context / token_count /
 // thread_settings_applied envelopes), headless exec usage records, or
 // irrelevant lines.
-func classifyLine(line string) lineKind {
-	sessionish := strings.Contains(line, "turn_context") ||
-		strings.Contains(line, "event_msg") ||
-		strings.Contains(line, "token_count") ||
-		strings.Contains(line, "thread_settings_applied") ||
-		strings.Contains(line, "session_meta")
-	if sessionish && strings.Contains(line, `"type"`) {
+func classifyLine(line []byte) lineKind {
+	sessionish := bytes.Contains(line, []byte("turn_context")) ||
+		bytes.Contains(line, []byte("event_msg")) ||
+		bytes.Contains(line, []byte("token_count")) ||
+		bytes.Contains(line, []byte("thread_settings_applied")) ||
+		bytes.Contains(line, []byte("session_meta"))
+	if sessionish && bytes.Contains(line, []byte(`"type"`)) {
 		return lineSession
 	}
-	if strings.Contains(line, `"usage":`) ||
-		strings.Contains(line, `"input_tokens":`) ||
-		strings.Contains(line, `"prompt_tokens":`) {
+	if bytes.Contains(line, []byte(`"usage":`)) ||
+		bytes.Contains(line, []byte(`"input_tokens":`)) ||
+		bytes.Contains(line, []byte(`"prompt_tokens":`)) {
 		return lineHeadless
 	}
 	return lineSkip
@@ -101,9 +107,9 @@ func fileMtime(path string) time.Time {
 // sessionEvent decodes one session rollout line and returns the entry for a
 // usable token_count event. session_meta/turn_context/thread_settings_applied
 // lines update the parser state instead.
-func (p *parser) sessionEvent(line string) (model.Entry, bool) {
+func (p *parser) sessionEvent(line []byte) (model.Entry, bool) {
 	var rl rolloutLine
-	if err := json.Unmarshal([]byte(line), &rl); err != nil {
+	if err := json.Unmarshal(line, &rl); err != nil {
 		return model.Entry{}, false
 	}
 	switch rl.Type {
@@ -217,9 +223,9 @@ func (p *parser) resolveModel(parsed string) string {
 // bare data/response envelope) into an entry, mirroring upstream's
 // add_codex_exec_event: usage/model/timestamp each resolve through the
 // top-level, data, result, and response fields in that order.
-func (p *parser) execEvent(line string, fallbackTS time.Time) (model.Entry, bool) {
+func (p *parser) execEvent(line []byte, fallbackTS time.Time) (model.Entry, bool) {
 	var rec execRecord
-	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+	if err := json.Unmarshal(line, &rec); err != nil {
 		return model.Entry{}, false
 	}
 	usage := firstUsage(rec.Usage, rec.Data, rec.Result, rec.Response)

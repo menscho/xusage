@@ -25,14 +25,17 @@ const DefaultBlockHours = 5
 func (s *Snapshot) Blocks(o *Opts, sessionDurationHours float64, now time.Time) []model.Block {
 	// The snapshot is already sorted by timestamp (loadAll sorts after dedup),
 	// so Blocks works on the filtered view directly — no per-request sort.
-	entries := s.filtered(o)
-
+	// We filter inline (iterating s.Entries through match) instead of calling
+	// s.filtered: that helper allocates a []*model.Entry sized to the whole
+	// snapshot (8 B/entry), rebuilt on every poll. The aggregators already
+	// inline this same loop to dodge that slice; blocks() was the last major
+	// caller still paying for it, so this matches the established pattern and
+	// removes the allocation from the ActiveBlock hot path.
+	loc := o.loc()
+	since := parseDay(o.Since, loc)
+	until := parseDayEndExclusive(o.Until, loc)
 	sessionDuration := time.Duration(sessionDurationHours * float64(time.Hour))
-	blocks := identifyBlocks(entries, sessionDuration, now)
-	for i := range blocks {
-		fillBlock(&blocks[i], o.Mode, now)
-	}
-	return blocks
+	return identifyBlocks(s, o, loc, since, until, sessionDuration, now)
 }
 
 // ActiveBlock returns the currently active block, or nil.
@@ -62,30 +65,51 @@ func rfc3339Millis(t time.Time) string {
 // upstream semantics: the open block closes when an entry is more than
 // sessionDuration after the block start or after the previous entry; in the
 // latter case a gap block spans [last+sessionDuration, next entry).
-func identifyBlocks(entries []*model.Entry, sessionDuration time.Duration, now time.Time) []model.Block {
-	if len(entries) == 0 {
-		return nil
-	}
+//
+// It iterates s.Entries inline through match() rather than taking a pre-
+// filtered []*model.Entry: that slice (built by Snapshot.filtered) costs 8
+// B/entry and is rebuilt on every poll, and the aggregators already avoid it
+// the same way. o's TZ/since/until bounds are precomputed by the caller.
+//
+// Blocks are filled from the pointer slice directly instead of copying entries
+// into Block.Entries. The snapshot is immutable during the call, so the
+// pointers stay valid for the synchronous fillBlock/blockBurnRate pass that
+// completes before the working slice is reused. Block.Entries stays nil (it is
+// json:"-" and only those two helpers ever read it), which avoids a full value
+// copy of every block's entries on every /api/pulse (~27 MB on a typical
+// snapshot).
+func identifyBlocks(s *Snapshot, o *Opts, loc *time.Location, since, until time.Time, sessionDuration time.Duration, now time.Time) []model.Block {
 	var blocks []model.Block
 	var currentStart time.Time
 	var current []*model.Entry
 
 	closeBlock := func() {
 		end := currentStart.Add(sessionDuration)
-		actual := current[len(current)-1].Timestamp
+		last := current[len(current)-1]
+		actual := last.Timestamp
 		isActive := end.After(now) && now.Sub(actual) < sessionDuration
-		blocks = append(blocks, model.Block{
+		// ActualEndTime aliases the snapshot entry's timestamp instead of
+		// copying it into a local and taking its address (which forces the
+		// time.Time onto the heap). The snapshot is immutable during the call,
+		// so the pointer stays valid for the synchronous JSON marshal that
+		// consumes the returned blocks.
+		b := model.Block{
 			ID:            rfc3339Millis(currentStart),
 			StartTime:     currentStart,
 			EndTime:       end,
-			ActualEndTime: &actual,
+			ActualEndTime: &last.Timestamp,
 			IsActive:      isActive,
-			Entries:       derefEntries(current),
-		})
-		current = nil // fresh backing array: closed blocks keep their entries
+		}
+		fillBlock(&b, current, o.Mode, now)
+		blocks = append(blocks, b)
+		current = current[:0] // reuse backing array; pointers only read synchronously in fillBlock
 	}
 
-	for _, e := range entries {
+	for i := range s.Entries {
+		e := &s.Entries[i]
+		if !match(o, loc, since, until, e) {
+			continue
+		}
 		if !currentStart.IsZero() {
 			last := current[len(current)-1].Timestamp
 			sinceStart := e.Timestamp.Sub(currentStart)
@@ -115,27 +139,29 @@ func identifyBlocks(entries []*model.Entry, sessionDuration time.Duration, now t
 	return blocks
 }
 
-// derefEntries copies pointer-referenced entries into an owned value slice:
-// Block.Entries backs the API response and must not alias the snapshot.
-func derefEntries(ptrs []*model.Entry) []model.Entry {
-	out := make([]model.Entry, len(ptrs))
-	for i, p := range ptrs {
-		out[i] = *p
+// stringSliceContains reports whether s contains v. Used in fillBlock to dedup
+// a block's model list without a per-block map allocation: a 5h window rarely
+// holds more than a couple of distinct models, so a linear scan beats a map.
+func stringSliceContains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
 	}
-	return out
+	return false
 }
 
 // fillBlock aggregates tokens/costs and derives burn rate + projection for
-// the active block. Gap blocks stay empty by definition. Models are listed in
-// first-seen order and usageLimitReset takes the first reset seen, both
-// mirroring upstream's entry scan.
-func fillBlock(b *model.Block, mode model.Mode, now time.Time) {
+// the active block. entries is the block's entries as pointers into the
+// (immutable) snapshot; they are read synchronously and never stored on the
+// block, so Block.Entries stays nil. Gap blocks stay empty by definition.
+// Models are listed in first-seen order and usageLimitReset takes the first
+// reset seen, both mirroring upstream's entry scan.
+func fillBlock(b *model.Block, entries []*model.Entry, mode model.Mode, now time.Time) {
 	if b.IsGap {
 		return
 	}
-	modelsSeen := map[string]bool{}
-	for i := range b.Entries {
-		e := &b.Entries[i]
+	for _, e := range entries {
 		b.InputTokens += e.InputTokens
 		b.OutputTokens += e.OutputTokens
 		b.CacheCreationTokens += e.CacheCreationTokens + e.CacheCreation1h
@@ -143,20 +169,22 @@ func fillBlock(b *model.Block, mode model.Mode, now time.Time) {
 		b.ExtraTotalTokens += e.ExtraTotalTokens
 		b.Cost += e.Cost(mode)
 		b.Messages += int64(max(e.Messages, 1))
-		if e.Model != "" && !modelsSeen[e.Model] {
-			modelsSeen[e.Model] = true
+		if e.Model != "" && !stringSliceContains(b.Models, e.Model) {
 			b.Models = append(b.Models, e.Model)
 		}
+		// Alias the entry's reset pointer instead of copying the time.Time
+		// into a local and re-addressing it (which promotes it to the heap).
+		// The snapshot is immutable during the call, so the pointer stays
+		// valid for the synchronous JSON marshal of the returned blocks.
 		if b.UsageLimitReset == nil && e.UsageLimitReset != nil {
-			t := *e.UsageLimitReset
-			b.UsageLimitReset = &t
+			b.UsageLimitReset = e.UsageLimitReset
 		}
 	}
 	b.TotalTokens = b.InputTokens + b.OutputTokens + b.CacheCreationTokens +
 		b.CacheReadTokens + b.ExtraTotalTokens
 
 	if b.IsActive {
-		if br := blockBurnRate(b); br != nil {
+		if br := blockBurnRate(b, entries); br != nil {
 			b.BurnRate = br
 			b.Projection = projectBlock(b, br, now)
 		}
@@ -167,11 +195,11 @@ func fillBlock(b *model.Block, mode model.Mode, now time.Time) {
 // over the exact elapsed span from first to last entry. A non-positive span
 // yields no rate (upstream returns None), so a burst inside a single instant
 // produces neither burn rate nor projection rather than an infinite one.
-func blockBurnRate(b *model.Block) *model.BurnRate {
-	if len(b.Entries) == 0 {
+func blockBurnRate(b *model.Block, entries []*model.Entry) *model.BurnRate {
+	if len(entries) == 0 {
 		return nil
 	}
-	minutes := b.Entries[len(b.Entries)-1].Timestamp.Sub(b.Entries[0].Timestamp).Minutes()
+	minutes := entries[len(entries)-1].Timestamp.Sub(entries[0].Timestamp).Minutes()
 	if minutes <= 0 {
 		return nil
 	}

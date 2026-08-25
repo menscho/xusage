@@ -27,32 +27,44 @@ func dedupe(entries []model.Entry) []model.Entry {
 		main map[string]int // request ID -> position in kept
 		side int            // canonical sidechain copy position, -1 = none
 	}
-	groups := map[string]*group{}
-	dropped := map[int]bool{}
-	var kept []model.Entry
+	// dedupKey keys groups by provider + message ID as a zero-alloc value type,
+	// avoiding a per-entry "provider\x00id" string concatenation.
+	type dedupKey struct {
+		provider string
+		id       string
+	}
+	groups := map[dedupKey]*group{}
+	// dropped is lazily allocated: most snapshots have no sidechain replay that
+	// a later main-chain copy supersedes, so the empty map would be thrown away.
+	var dropped map[int]bool
+	// kept never exceeds the input length: every kept element traces back to at
+	// least one input entry and duplicates only collapse. Pre-sizing removes all
+	// reallocations and full-slice copies from the append loop below.
+	kept := make([]model.Entry, 0, len(entries))
 
-	keep := func(e model.Entry, seen map[string]int) {
+	keep := func(e *model.Entry, seen map[string]int) {
 		pos, ok := seen[e.RequestID]
 		if !ok {
 			seen[e.RequestID] = len(kept)
-			kept = append(kept, e)
+			kept = append(kept, *e)
 			return
 		}
-		if prefer(&e, &kept[pos]) {
-			kept[pos] = e
+		if prefer(e, &kept[pos]) {
+			kept[pos] = *e
 		}
 	}
 
-	for _, e := range entries {
+	for i := range entries {
+		e := entries[i]
 		if e.ID == "" {
 			kept = append(kept, e) // unidentifiable entries never dedup
 			continue
 		}
-		idKey := e.Provider + "\x00" + e.ID
-		g := groups[idKey]
+		gk := dedupKey{provider: e.Provider, id: e.ID}
+		g := groups[gk]
 		if g == nil {
 			g = &group{main: map[string]int{}, side: -1}
-			groups[idKey] = g
+			groups[gk] = g
 		}
 		if e.IsSidechain {
 			if len(g.main) > 0 {
@@ -69,22 +81,28 @@ func dedupe(entries []model.Entry) []model.Entry {
 			continue
 		}
 		if g.side >= 0 {
+			if dropped == nil {
+				dropped = map[int]bool{}
+			}
 			dropped[g.side] = true // main-chain copy supersedes sidechain replays
 			g.side = -1
 		}
-		keep(e, g.main)
+		keep(&entries[i], g.main)
 	}
 
 	if len(dropped) == 0 {
 		return kept
 	}
-	out := make([]model.Entry, 0, len(kept)-len(dropped))
-	for i, e := range kept {
+	// kept is locally owned: compact in place to avoid allocating a second
+	// slice. n <= i always, so no live element is read after being overwritten.
+	n := 0
+	for i := range kept {
 		if !dropped[i] {
-			out = append(out, e)
+			kept[n] = kept[i]
+			n++
 		}
 	}
-	return out
+	return kept[:n]
 }
 
 // prefer reports whether candidate c should replace incumbent x as canonical:

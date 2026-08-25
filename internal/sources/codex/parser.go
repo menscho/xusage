@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"xusage/internal/model"
+	"xusage/internal/sources/adapter"
 )
 
 // usageInfo mirrors payload.info of a token_count event.
@@ -182,7 +183,9 @@ type parser struct {
 }
 
 // nextEntry builds an Entry from per-event token buckets. The caller resolves
-// deltas against the running total first, so these values are final.
+// deltas against the running total first, so these values are final. The model
+// name is interned so the (frequently repeated) Model/RawModel strings share
+// one backing array per distinct value across the whole transcript.
 func (p *parser) nextEntry(ts time.Time, modelName string, fast bool, in, cacheRead, out, extraTotal uint64) model.Entry {
 	if modelName == "" {
 		modelName = p.model
@@ -192,10 +195,11 @@ func (p *parser) nextEntry(ts time.Time, modelName string, fast bool, in, cacheR
 	}
 	p.model = modelName
 	p.fast = fast
+	m := adapter.Intern(modelName)
 	return model.Entry{
 		Timestamp:        ts,
-		Model:            modelName,
-		RawModel:         modelName,
+		Model:            m,
+		RawModel:         m,
 		Project:          p.project,
 		SessionID:        p.sessionID,
 		InputTokens:      in,
