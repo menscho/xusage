@@ -1,3 +1,5 @@
+not gonna work on this anymore, discontinued, but still works.
+
 # xusage
 
 > A local usage dashboard and cost tracker for coding agents — a fast,
